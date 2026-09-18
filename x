@@ -7,28 +7,57 @@ GO
 
 DECLARE @SnapshotDate datetime = GETDATE();
 
-/* CHANGE 1: added seq (insertion order) as the last column */
+/* ------------------------------------------------------------
+   CHANGE 1: the slow part.
+   The original joined sys.sysprocesses to itself. That view is
+   expensive to build, and in a join it gets rebuilt (once or
+   many times). Now it is read ONCE into a small table variable,
+   and the self-join runs on that table in memory.
+   Only the 3 columns the main query really uses are kept:
+   spid, blocked, dbid.
+   ------------------------------------------------------------ */
+DECLARE @sp TABLE
+(
+    spid    SMALLINT NOT NULL,
+    blocked SMALLINT NOT NULL,
+    dbid    SMALLINT NOT NULL,
+    INDEX ix_sp_spid NONCLUSTERED (spid)
+);
+
+INSERT INTO @sp (spid, blocked, dbid)
+SELECT spid, blocked, dbid
+FROM sys.sysprocesses WITH (NOLOCK);
+
 DECLARE @blocked TABLE
 (
-    dbid                SMALLINT   NOT NULL,
-    last_batch          DATETIME   NOT NULL,
-    open_tran           SMALLINT   NOT NULL,
-    sql_handle          BINARY(20) NOT NULL,
-    session_id          SMALLINT   NOT NULL,
-    blocking_session_id SMALLINT   NOT NULL,
-    lastwaittype        NCHAR(32)  NOT NULL,
-    waittime            BIGINT     NOT NULL,
-    cpu                 INT        NOT NULL,
-    physical_io         BIGINT     NOT NULL,
-    memusage            INT        NOT NULL,
+    dbid                SMALLINT NOT NULL,
+    session_id          SMALLINT NOT NULL,
+    blocking_session_id SMALLINT NOT NULL,
     seq                 INT IDENTITY(1,1) NOT NULL
 );
 
-/* Populate @blocked with all sessions that are actively blocking others */
-INSERT INTO @blocked (dbid,last_batch,open_tran,sql_handle,session_id,blocking_session_id,lastwaittype,waittime,cpu,physical_io,memusage)
-SELECT sys1.dbid,sys1.last_batch,sys1.open_tran,sys1.sql_handle,sys2.spid,sys2.blocked,sys2.lastwaittype,sys2.waittime,sys2.cpu,sys2.physical_io,sys2.memusage
-FROM sys.sysprocesses (NOLOCK) AS sys1
-JOIN sys.sysprocesses (NOLOCK) AS sys2 ON sys2.blocked = sys1.spid;
+/* Populate @blocked with all sessions that are actively blocking others
+   (same logic as the original: sys1 = blocker, sys2 = blocked session) */
+INSERT INTO @blocked (dbid, session_id, blocking_session_id)
+SELECT sys1.dbid, sys2.spid, sys2.blocked
+FROM @sp AS sys2
+JOIN @sp AS sys1
+    ON sys1.spid = sys2.blocked;
+
+/* ------------------------------------------------------------
+   OPTIONAL - even faster, no sysprocesses at all (DMVs only).
+   Use it INSTEAD of the @sp block + the INSERT above.
+   Caveat: dm_exec_requests only shows blocking of the main
+   thread, sysprocesses can also show blocked parallel worker
+   threads, so in rare parallel-query cases results can differ.
+
+   INSERT INTO @blocked (dbid, session_id, blocking_session_id)
+   SELECT s1.database_id, r2.session_id, r2.blocking_session_id
+   FROM sys.dm_exec_requests AS r2
+   JOIN sys.dm_exec_sessions AS s1
+       ON s1.session_id = r2.blocking_session_id
+   WHERE r2.blocking_session_id > 0;
+   ------------------------------------------------------------ */
 
 /* CHANGE 2: build the lookup once (one row per session id, first inserted row wins) */
 DECLARE @blocked_lookup TABLE
