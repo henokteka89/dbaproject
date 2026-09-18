@@ -135,3 +135,4 @@ AND
 )
 AND ISNULL(DB_NAME(r.database_id), '') NOT IN ('distribution', 'msdb', 'tempdb')
 --option (fast 10)
+go
