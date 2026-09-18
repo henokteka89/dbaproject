@@ -1,0 +1,1733 @@
+<#
+================================================================================
+ QueryExecutionHistory.ps1
+--------------------------------------------------------------------------------
+ A WinForms GUI for viewing recent query execution history on a SQL Server
+ instance -- a lightweight, Query-Store-aware alternative to hand-writing
+ DMV queries every time someone asks "what's been running / why is proc X
+ slow right now".
+
+ WHAT IT DOES
+   - You point it at a Server + Database.
+   - It auto-detects whether Query Store is ON for that database and
+     transparently uses the right backend:
+         Query Store ON  -> sys.query_store_* catalog views (durable history)
+         Query Store OFF -> plan cache DMVs (sys.dm_exec_query_stats /
+                             sys.dm_exec_procedure_stats) as a best-effort
+                             fallback -- see the caveats in the "No Query
+                             Store" section below.
+   - Time range defaults to the LAST 30 MINUTES, with quick presets and a
+     custom range option.
+   - Search box accepts EITHER a Query Store query_id (a plain integer) OR
+     a stored procedure name (schema.name). When Query Store is off, a
+     hex value (0x....) is treated as a plan-cache query_hash instead,
+     since plan cache has no persistent query_id.
+   - PSP-aware (SQL Server 2022+ Parameter Sensitive Plan optimization):
+     searching a PSP-optimized proc by name/query_id automatically expands
+     to its query variants via sys.query_store_query_variant, because the
+     "dispatcher" query_id you'd find directly has no plans/runtime stats
+     of its own -- those live under separate variant query_ids that report
+     object_id = 0. Without this, such a proc would search-return nothing.
+     Rows resulting from this expansion are flagged is_psp_variant = 1 with
+     psp_dispatcher_query_id set, and proc_name is still resolved via the
+     dispatcher. No-op (and no error) on pre-2022 instances.
+   - Designed to stay fast regardless of user-data size (see PERFORMANCE
+     NOTES below) -- it never reads a single row of your actual tables.
+   - A Chart tab sits next to the results grid: one colored bar per query
+     (like Query Store's own "Top Resource Consuming Queries" view), with
+     a metric dropdown (duration / CPU / executions / logical reads) and
+     a hover tooltip per bar. It's built from whichever backend answered
+     the search, so it looks and behaves the same whether Query Store is
+     on or you're on the plan-cache fallback.
+   - A "Remove Plan..." button (next to Search) lets you discard a plan
+     found by the last search: sp_query_store_remove_plan when Query
+     Store is on, DBCC FREEPROCCACHE(plan_handle) when it's off. If the
+     search turned up more than one plan for the query, you're prompted
+     to pick which one; with only one, it goes straight to a confirm
+     dialog. THIS IS THE ONE PART OF THE TOOL THAT WRITES ANYTHING -- it
+     forces a recompile of whatever you remove, cannot be undone, and
+     needs elevated permission (db_owner for the Query Store path,
+     ALTER SERVER STATE for the DBCC path) beyond what read-only search
+     needs. Everything else in this tool only ever issues SELECT.
+   - A "Force Plan..." button (Query Store only -- stays disabled on the
+     plan-cache fallback, since plan cache has no such concept) pins the
+     plan you pick for its query via sp_query_store_force_plan. Click it
+     again on an already-forced plan and it offers to unforce instead
+     (sp_query_store_unforce_plan) -- also needs db_owner.
+   - The search box remembers what you've searched: it's a ComboBox now,
+     not a plain textbox, backed by a small JSON file next to this script
+     (QueryExecutionHistory.history.json) that's loaded on startup and
+     updated after every successful search. Click the dropdown arrow to
+     reuse a past query_id/proc name, or just start typing for
+     autocomplete against your own history.
+
+ REQUIREMENTS
+   - Windows PowerShell 5.1 (uses the in-box System.Data.SqlClient; this is
+     what ships with every Windows Server/desktop, so there is nothing to
+     install). PowerShell 7 works too IF System.Data.SqlClient or
+     Microsoft.Data.SqlClient is resolvable in that session.
+   - A login with VIEW SERVER STATE (for the plan-cache path) and/or
+     VIEW DATABASE STATE / db_owner (for Query Store views, needed to read
+     sys.query_store_*) on the target database.
+   - Searching is READ-ONLY: it issues SELECT statements against system
+     catalog views/DMVs only, never touches user tables, never writes
+     anything. The one exception is the opt-in "Remove Plan..." button
+     (see below) -- that's a deliberate, confirmed, one-row action, not
+     something a search ever triggers on its own.
+
+ PERFORMANCE NOTES (why this stays fast even on a 40 TB database)
+   - Every query here reads Query Store's or the plan cache's internal
+     METADATA ONLY. That metadata's size depends on query diversity and
+     retention settings -- NOT on the size of your user data. A 40 TB
+     OLTP database and a 40 GB database with a similar workload shape
+     perform identically here.
+   - The Query Store query filters sys.query_store_runtime_stats_interval
+     (small: one row per retention interval, e.g. hourly) BEFORE joining
+     to the much larger runtime_stats table -- filter-the-small-table-first.
+   - Every query uses OPTION (RECOMPILE). These are deliberately written as
+     "catch-all" queries (query_id OR proc name OR neither), and RECOMPILE
+     lets the optimizer build a plan tuned to whichever parameter was
+     actually supplied on each run, instead of risking a plan cached for
+     a different search that performs badly for this one. Recompiling
+     against small metadata tables is cheap; parameter-sniffing bugs on a
+     catch-all query are not.
+   - Every result set is capped (TOP N, configurable, default 500 rows) so
+     a broad "no filter" search can't accidentally pull back everything.
+
+ NO QUERY STORE? READ THIS
+   The plan cache is VOLATILE -- entries are evicted on recompiles, memory
+   pressure, index/statistics changes, or a service restart. This view
+   shows "what's still cached", not a durable log. A query that ran inside
+   your time window but was since evicted will not appear. If you need a
+   real, durable execution history without enabling Query Store, the right
+   long-term answer is a lightweight Extended Events session
+   (rpc_completed / sql_batch_completed) writing to a rollover file target
+   -- that is a natural phase 2 for this tool, not built here yet.
+
+ USAGE
+   powershell.exe -File .\QueryExecutionHistory.ps1
+   clear 
+cd D:\DBALearning
+.\QueryExecutionHistory_v3_planremove.ps1
+================================================================================
+#>
+
+[CmdletBinding()]
+param()
+
+#region ------------------------- Assemblies ---------------------------------
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Data
+
+# The Chart control ships in-box with .NET Framework (Windows PowerShell
+# 5.1), which is why this whole tool avoids extra installs. It is NOT
+# in-box on PowerShell 7 / .NET (Core), so this is wrapped: if it can't
+# load, the app still runs fine with the grid alone, just without the
+# Chart tab.
+$script:ChartAvailable = $true
+try { Add-Type -AssemblyName System.Windows.Forms.DataVisualization -ErrorAction Stop }
+catch { $script:ChartAvailable = $false }
+
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+#endregion
+
+#region ------------------------------ SQL text -------------------------------
+
+# Query Store path. Parameters bound: @QueryId (int, nullable), @ProcName
+# (nvarchar, nullable), @StartUtc / @EndUtc (datetimeoffset), @RowCap (int).
+#
+# PSP (Parameter Sensitive Plan optimization, SQL Server 2022+) AWARENESS:
+# When PSP splits a query into per-parameter-range variants, the query row
+# you find by object_id/query_id is the "dispatcher" -- it never itself
+# executes and carries NO rows in query_store_plan/runtime_stats. The real
+# plans live under separate "variant" query_ids (sys.query_store_query_variant
+# .query_variant_query_id), and those variant rows report object_id = 0 in
+# sys.query_store_query (same as an ad-hoc query), so a plain object_id/
+# query_id filter silently returns zero rows for any PSP-optimized proc.
+# #TargetQueryIds below resolves direct matches AND (when available) their
+# variants, so PSP procs behave the same as any other search.
+# sys.query_store_query_variant only exists on SQL Server 2022+ (and Azure
+# SQL). OBJECT_ID() is a safe metadata lookup on any version (it does not
+# require the object to exist), but a direct static reference to the view
+# would fail to bind at compile time on older versions even inside a
+# never-taken branch -- so the variant lookup runs as dynamic SQL, guarded
+# by that OBJECT_ID() check, targeting the #temp table (visible to dynamic
+# SQL in the same session, unlike a table variable).
+$script:SqlQueryStore = @'
+DECLARE @ObjectId INT = CASE WHEN @ProcName IS NOT NULL THEN OBJECT_ID(@ProcName) END;
+
+IF @ProcName IS NOT NULL AND @ObjectId IS NULL
+BEGIN
+    RAISERROR(N'Could not resolve proc name "%s" to an object in this database.', 16, 1, @ProcName);
+    RETURN;
+END;
+
+CREATE TABLE #TargetQueryIds (query_id BIGINT NOT NULL PRIMARY KEY, dispatcher_query_id BIGINT NULL);
+
+INSERT INTO #TargetQueryIds (query_id, dispatcher_query_id)
+SELECT q.query_id, NULL
+FROM sys.query_store_query AS q
+WHERE (@QueryId  IS NULL OR q.query_id  = @QueryId)
+  AND (@ObjectId IS NULL OR q.object_id = @ObjectId);
+
+IF OBJECT_ID('sys.query_store_query_variant') IS NOT NULL
+BEGIN
+    DECLARE @PspSql NVARCHAR(MAX) = N'
+INSERT INTO #TargetQueryIds (query_id, dispatcher_query_id)
+SELECT qv.query_variant_query_id, qv.parent_query_id
+FROM sys.query_store_query_variant AS qv
+WHERE EXISTS (SELECT 1 FROM #TargetQueryIds t WHERE t.query_id = qv.parent_query_id)
+  AND NOT EXISTS (SELECT 1 FROM #TargetQueryIds t2 WHERE t2.query_id = qv.query_variant_query_id);';
+    EXEC sys.sp_executesql @PspSql;
+END;
+
+;WITH Ivl AS (
+    SELECT runtime_stats_interval_id
+    FROM sys.query_store_runtime_stats_interval
+    WHERE start_time < @EndUtc AND end_time > @StartUtc
+),
+Agg AS (
+    SELECT
+        rs.plan_id,
+        SUM(rs.count_executions) AS count_executions,
+        SUM(CAST(rs.count_executions AS DECIMAL(19,4)) * rs.avg_duration)        / NULLIF(SUM(rs.count_executions),0) AS avg_duration_us,
+        MAX(rs.max_duration) AS max_duration_us,
+        MIN(rs.min_duration) AS min_duration_us,
+        SUM(CAST(rs.count_executions AS DECIMAL(19,4)) * rs.avg_cpu_time)        / NULLIF(SUM(rs.count_executions),0) AS avg_cpu_us,
+        SUM(CAST(rs.count_executions AS DECIMAL(19,4)) * rs.avg_logical_io_reads) / NULLIF(SUM(rs.count_executions),0) AS avg_logical_reads,
+        SUM(CAST(rs.count_executions AS DECIMAL(19,4)) * rs.avg_physical_io_reads)/ NULLIF(SUM(rs.count_executions),0) AS avg_physical_reads,
+        SUM(CAST(rs.count_executions AS DECIMAL(19,4)) * rs.avg_rowcount)        / NULLIF(SUM(rs.count_executions),0) AS avg_rowcount,
+        SUM(CASE WHEN rs.execution_type <> 0 THEN rs.count_executions ELSE 0 END) AS non_regular_count
+    FROM sys.query_store_runtime_stats AS rs
+    JOIN Ivl ON Ivl.runtime_stats_interval_id = rs.runtime_stats_interval_id
+    WHERE rs.plan_id IN (SELECT p2.plan_id FROM sys.query_store_plan AS p2 WHERE p2.query_id IN (SELECT query_id FROM #TargetQueryIds))
+    GROUP BY rs.plan_id
+)
+SELECT TOP (@RowCap)
+    q.query_id,
+    COALESCE(
+        CASE WHEN q.object_id = 0 THEN NULL ELSE OBJECT_SCHEMA_NAME(q.object_id) + N'.' + OBJECT_NAME(q.object_id) END,
+        CASE WHEN dq.object_id IS NULL OR dq.object_id = 0 THEN NULL ELSE OBJECT_SCHEMA_NAME(dq.object_id) + N'.' + OBJECT_NAME(dq.object_id) END
+    ) AS proc_name,
+    qt.query_sql_text,
+    a.plan_id,
+    p.is_forced_plan,
+    a.count_executions,
+    CAST(a.avg_duration_us / 1000.0 AS DECIMAL(19,3)) AS avg_duration_ms,
+    CAST(a.max_duration_us / 1000.0 AS DECIMAL(19,3)) AS max_duration_ms,
+    CAST(a.min_duration_us / 1000.0 AS DECIMAL(19,3)) AS min_duration_ms,
+    CAST(a.avg_cpu_us / 1000.0 AS DECIMAL(19,3)) AS avg_cpu_ms,
+    CAST(a.avg_logical_reads AS DECIMAL(19,1)) AS avg_logical_reads,
+    CAST(a.avg_physical_reads AS DECIMAL(19,1)) AS avg_physical_reads,
+    CAST(a.avg_rowcount AS DECIMAL(19,1)) AS avg_rowcount,
+    a.non_regular_count,
+    p.last_execution_time,
+    CAST(p.query_plan AS NVARCHAR(MAX)) AS query_plan_xml,
+    CASE WHEN t.dispatcher_query_id IS NOT NULL THEN 1 ELSE 0 END AS is_psp_variant,
+    t.dispatcher_query_id AS psp_dispatcher_query_id
+FROM Agg AS a
+JOIN sys.query_store_plan AS p        ON p.plan_id = a.plan_id
+JOIN sys.query_store_query AS q       ON q.query_id = p.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+JOIN #TargetQueryIds AS t             ON t.query_id = q.query_id
+LEFT JOIN sys.query_store_query AS dq ON dq.query_id = t.dispatcher_query_id
+ORDER BY a.count_executions * a.avg_duration_us DESC
+OPTION (RECOMPILE);
+
+DROP TABLE #TargetQueryIds;
+'@
+
+# Plan-cache fallback path (no Query Store). Parameters bound: @ProcName
+# (nvarchar, nullable), @QueryHash (varbinary(8), nullable), @StartLocal /
+# @EndLocal (datetime2), @RowCap (int). Returns TWO result sets: proc-level
+# rollup, then statement-level rollup.
+$script:SqlPlanCache = @'
+DECLARE @DbId INT = DB_ID();
+DECLARE @ObjectId INT = CASE WHEN @ProcName IS NOT NULL THEN OBJECT_ID(@ProcName) END;
+
+IF @ProcName IS NOT NULL AND @ObjectId IS NULL
+BEGIN
+    RAISERROR(N'Could not resolve proc name "%s" to an object in this database.', 16, 1, @ProcName);
+    RETURN;
+END;
+
+-- Procedure-level rollup: used when @ProcName is supplied, or when neither
+-- filter is supplied (general "what's been running" overview).
+SELECT TOP (@RowCap)
+    'procedure' AS source,
+    OBJECT_SCHEMA_NAME(ps.object_id, ps.database_id) + N'.' + OBJECT_NAME(ps.object_id, ps.database_id) AS proc_name,
+    CAST(NULL AS VARCHAR(20)) AS query_hash_hex,
+    CAST(NULL AS NVARCHAR(MAX)) AS query_sql_text,
+    ps.execution_count,
+    CAST(ps.total_worker_time  / 1000.0 / ps.execution_count AS DECIMAL(19,3)) AS avg_cpu_ms,
+    CAST(ps.total_elapsed_time / 1000.0 / ps.execution_count AS DECIMAL(19,3)) AS avg_duration_ms,
+    CAST(ps.total_logical_reads  * 1.0 / ps.execution_count AS DECIMAL(19,1)) AS avg_logical_reads,
+    CAST(ps.total_physical_reads * 1.0 / ps.execution_count AS DECIMAL(19,1)) AS avg_physical_reads,
+    ps.last_execution_time,
+    ps.cached_time AS plan_cached_time,
+    CAST(qp.query_plan AS NVARCHAR(MAX)) AS query_plan_xml,
+    CONVERT(VARCHAR(130), ps.plan_handle, 1) AS plan_handle_hex
+FROM sys.dm_exec_procedure_stats AS ps
+OUTER APPLY sys.dm_exec_query_plan(ps.plan_handle) AS qp
+WHERE ps.database_id = @DbId
+  AND ps.last_execution_time BETWEEN @StartLocal AND @EndLocal
+  AND (@ObjectId IS NULL OR ps.object_id = @ObjectId)
+  AND @QueryHash IS NULL
+ORDER BY ps.total_worker_time DESC
+OPTION (RECOMPILE);
+
+-- Statement-level rollup: used when @QueryHash is supplied, or when neither
+-- filter is supplied. Server-wide (plan cache statement text is not neatly
+-- scoped to one database the way Query Store is).
+SELECT TOP (@RowCap)
+    'statement' AS source,
+    CAST(NULL AS NVARCHAR(261)) AS proc_name,
+    CONVERT(VARCHAR(20), qs.query_hash, 1) AS query_hash_hex,
+    st.text AS query_sql_text,
+    qs.execution_count,
+    CAST(qs.total_worker_time  / 1000.0 / qs.execution_count AS DECIMAL(19,3)) AS avg_cpu_ms,
+    CAST(qs.total_elapsed_time / 1000.0 / qs.execution_count AS DECIMAL(19,3)) AS avg_duration_ms,
+    CAST(qs.total_logical_reads  * 1.0 / qs.execution_count AS DECIMAL(19,1)) AS avg_logical_reads,
+    CAST(qs.total_physical_reads * 1.0 / qs.execution_count AS DECIMAL(19,1)) AS avg_physical_reads,
+    qs.last_execution_time,
+    qs.creation_time AS plan_cached_time,
+    CAST(qp.query_plan AS NVARCHAR(MAX)) AS query_plan_xml,
+    CONVERT(VARCHAR(130), qs.plan_handle, 1) AS plan_handle_hex
+FROM sys.dm_exec_query_stats AS qs
+OUTER APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
+WHERE qs.last_execution_time BETWEEN @StartLocal AND @EndLocal
+  AND (@QueryHash IS NULL OR qs.query_hash = @QueryHash)
+  AND @ObjectId IS NULL
+ORDER BY qs.total_worker_time DESC
+OPTION (RECOMPILE);
+'@
+
+$script:SqlIsQueryStoreOn = @'
+SELECT actual_state_desc
+FROM sys.database_query_store_options;
+'@
+
+# Query Store ONLY: per-interval, per-plan detail (no cross-interval
+# aggregation, unlike SqlQueryStore above) -- this is the same granularity
+# Query Store's own "Tracked Queries" scatter chart plots: one point per
+# plan per retention interval over time. Feeds the Timeline tab. There is
+# no equivalent for the plan-cache fallback -- the plan cache is a single
+# cumulative snapshot per plan, not a time series, so it cannot draw this
+# chart (the Timeline tab says so rather than faking it).
+#
+# PSP-aware for the same reason as SqlQueryStore above: a PSP-optimized
+# proc's dispatcher query_id has no runtime_stats rows at all, and its
+# variant query_ids report object_id = 0, so without this expansion a PSP
+# proc's timeline would come back completely empty.
+$script:SqlQueryStoreTimeline = @'
+DECLARE @ObjectId INT = CASE WHEN @ProcName IS NOT NULL THEN OBJECT_ID(@ProcName) END;
+
+IF @ProcName IS NOT NULL AND @ObjectId IS NULL
+BEGIN
+    RAISERROR(N'Could not resolve proc name "%s" to an object in this database.', 16, 1, @ProcName);
+    RETURN;
+END;
+
+CREATE TABLE #TlTargetQueryIds (query_id BIGINT NOT NULL PRIMARY KEY, dispatcher_query_id BIGINT NULL);
+
+INSERT INTO #TlTargetQueryIds (query_id, dispatcher_query_id)
+SELECT q.query_id, NULL
+FROM sys.query_store_query AS q
+WHERE (@QueryId  IS NULL OR q.query_id  = @QueryId)
+  AND (@ObjectId IS NULL OR q.object_id = @ObjectId);
+
+IF OBJECT_ID('sys.query_store_query_variant') IS NOT NULL
+BEGIN
+    DECLARE @TlPspSql NVARCHAR(MAX) = N'
+INSERT INTO #TlTargetQueryIds (query_id, dispatcher_query_id)
+SELECT qv.query_variant_query_id, qv.parent_query_id
+FROM sys.query_store_query_variant AS qv
+WHERE EXISTS (SELECT 1 FROM #TlTargetQueryIds t WHERE t.query_id = qv.parent_query_id)
+  AND NOT EXISTS (SELECT 1 FROM #TlTargetQueryIds t2 WHERE t2.query_id = qv.query_variant_query_id);';
+    EXEC sys.sp_executesql @TlPspSql;
+END;
+
+;WITH Ivl AS (
+    SELECT runtime_stats_interval_id, end_time
+    FROM sys.query_store_runtime_stats_interval
+    WHERE start_time < @EndUtc AND end_time > @StartUtc
+)
+SELECT TOP (@RowCap)
+    q.query_id,
+    p.plan_id,
+    COALESCE(
+        CASE WHEN q.object_id = 0 THEN NULL ELSE OBJECT_SCHEMA_NAME(q.object_id) + N'.' + OBJECT_NAME(q.object_id) END,
+        CASE WHEN dq.object_id IS NULL OR dq.object_id = 0 THEN NULL ELSE OBJECT_SCHEMA_NAME(dq.object_id) + N'.' + OBJECT_NAME(dq.object_id) END
+    ) AS proc_name,
+    i.end_time AS interval_end_time,
+    rs.count_executions,
+    CAST(rs.avg_duration / 1000.0 AS DECIMAL(19,3)) AS avg_duration_ms,
+    CAST(rs.avg_cpu_time / 1000.0 AS DECIMAL(19,3)) AS avg_cpu_ms,
+    CAST(rs.avg_logical_io_reads AS DECIMAL(19,1)) AS avg_logical_reads
+FROM sys.query_store_runtime_stats AS rs
+JOIN Ivl AS i                          ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+JOIN sys.query_store_plan AS p         ON p.plan_id = rs.plan_id
+JOIN sys.query_store_query AS q        ON q.query_id = p.query_id
+JOIN #TlTargetQueryIds AS t            ON t.query_id = q.query_id
+LEFT JOIN sys.query_store_query AS dq  ON dq.query_id = t.dispatcher_query_id
+ORDER BY i.end_time
+OPTION (RECOMPILE);
+
+DROP TABLE #TlTargetQueryIds;
+'@
+
+#endregion
+
+#region ------------------------------ Helpers --------------------------------
+
+$script:ToolTip = New-Object System.Windows.Forms.ToolTip
+
+# TextBox.PlaceholderText only exists on .NET (Core) WinForms, not on the
+# classic .NET Framework WinForms that ships with Windows PowerShell 5.1.
+# Try it, and always also set a tooltip so the hint shows up either way.
+function Set-Placeholder {
+    param([System.Windows.Forms.Control]$Control, [string]$Text)
+    try { $Control.PlaceholderText = $Text } catch { }
+    $script:ToolTip.SetToolTip($Control, $Text)
+}
+
+function New-SqlConnectionString {
+    param(
+        [Parameter(Mandatory)] [string]$ServerName,
+        # Optional: omit (or pass blank) to connect at the server level --
+        # e.g. to list databases before you've picked one -- and SQL Server
+        # falls back to the login's own default database.
+        [string]$DatabaseName,
+        [switch]$UseSqlAuth,
+        [string]$SqlUser,
+        [string]$SqlPassword
+    )
+    $builder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+    $builder['Server']                 = $ServerName
+    if ($DatabaseName) { $builder['Database'] = $DatabaseName }
+    $builder['Connect Timeout']        = 10
+    $builder['TrustServerCertificate'] = $true
+    $builder['Encrypt']                = $false
+    $builder['Application Name']       = 'QueryExecutionHistory.ps1'
+    if ($UseSqlAuth) {
+        $builder['User ID']  = $SqlUser
+        $builder['Password'] = $SqlPassword
+    } else {
+        $builder['Integrated Security'] = $true
+    }
+    return $builder.ConnectionString
+}
+
+# --- Search history: the "cache of proc names / query ids you've
+# searched" ------------------------------------------------------------
+# A small JSON file next to this script, so it persists across restarts.
+# $PSScriptRoot is empty if the script is dot-sourced/pasted rather than
+# run with -File, so this falls back to the current directory rather
+# than failing outright.
+$script:SearchHistoryPath = Join-Path -Path $(if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }) -ChildPath 'QueryExecutionHistory.history.json'
+$script:MaxSearchHistory = 30
+
+function Import-SearchHistory {
+    if (-not (Test-Path -LiteralPath $script:SearchHistoryPath)) { return @() }
+    try {
+        $raw = Get-Content -LiteralPath $script:SearchHistoryPath -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        $items = @(ConvertFrom-Json -InputObject $raw -ErrorAction Stop)
+        return @($items | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    }
+    catch {
+        # Corrupt or unreadable history file shouldn't block the app from
+        # starting -- just start with an empty history.
+        return @()
+    }
+}
+
+function Export-SearchHistory {
+    param([string[]]$History)
+    try {
+        ($History | ConvertTo-Json) | Set-Content -LiteralPath $script:SearchHistoryPath -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        # Read-only folder, locked file, etc. -- history just won't persist
+        # this run; not worth interrupting the user over.
+    }
+}
+
+# Adds $Text to the front of the in-memory + on-disk history (de-duplicated,
+# case-insensitive, capped at $script:MaxSearchHistory) and refreshes the
+# search ComboBox's dropdown list to match.
+function Add-SearchHistory {
+    param([string]$Text)
+    $trimmed = if ($Text) { $Text.Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($trimmed)) { return }
+
+    $script:SearchHistory = @($script:SearchHistory | Where-Object { $_ -and ($_ -ne $trimmed) })
+    $script:SearchHistory = @($trimmed) + $script:SearchHistory
+    if ($script:SearchHistory.Count -gt $script:MaxSearchHistory) {
+        $script:SearchHistory = $script:SearchHistory[0..($script:MaxSearchHistory - 1)]
+    }
+    Export-SearchHistory -History $script:SearchHistory
+
+    $currentText = $txtSearch.Text
+    $txtSearch.Items.Clear()
+    if ($script:SearchHistory.Count -gt 0) { [void]$txtSearch.Items.AddRange($script:SearchHistory) }
+    $txtSearch.Text = $currentText
+}
+
+# --- Per-server database list cache -------------------------------------
+# A second small JSON file next to this script: { "server1": ["db",...],
+# "server2": [...] }. Lets the Database dropdown pre-fill for a server
+# you've listed before without a live query, and is what a blank-Database
+# Connect refreshes.
+$script:DatabaseCachePath = Join-Path -Path $(if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }) -ChildPath 'QueryExecutionHistory.databases.json'
+
+function Import-DatabaseCache {
+    if (-not (Test-Path -LiteralPath $script:DatabaseCachePath)) { return @{} }
+    try {
+        $raw = Get-Content -LiteralPath $script:DatabaseCachePath -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
+        $obj = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+        $cache = @{}
+        # ConvertFrom-Json gives a PSCustomObject for a JSON object; walk its
+        # properties rather than assuming it behaves like a hashtable.
+        foreach ($prop in $obj.PSObject.Properties) {
+            $cache[$prop.Name] = @($prop.Value | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        }
+        return $cache
+    }
+    catch {
+        return @{}
+    }
+}
+
+function Export-DatabaseCache {
+    param([hashtable]$Cache)
+    try {
+        ($Cache | ConvertTo-Json -Depth 3) | Set-Content -LiteralPath $script:DatabaseCachePath -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        # Not worth interrupting the user over a failed cache write.
+    }
+}
+
+# Resolves what the user typed into the search box:
+#   pure integer      -> Query Store query_id
+#   0x.... hex string -> plan-cache query_hash
+#   anything else     -> proc name (schema.name); schema defaults to dbo
+function Resolve-SearchInput {
+    param([string]$Text)
+
+    $result = [ordered]@{ QueryId = $null; QueryHash = $null; ProcName = $null }
+    $trimmed = if ($Text) { $Text.Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return $result
+    }
+    if ($trimmed -match '^\d+$') {
+        $result.QueryId = [int]$trimmed
+    }
+    elseif ($trimmed -match '^0x[0-9a-fA-F]+$') {
+        $hex = $trimmed.Substring(2)
+        if ($hex.Length % 2 -eq 1) { $hex = '0' + $hex }
+        $bytes = New-Object byte[] ($hex.Length / 2)
+        for ($i = 0; $i -lt $bytes.Length; $i++) {
+            $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
+        }
+        $result.QueryHash = $bytes
+    }
+    else {
+        $result.ProcName = if ($trimmed -notmatch '\.') { "dbo.$trimmed" } else { $trimmed }
+    }
+    return $result
+}
+
+function Get-TimeRangeUtc {
+    param([string]$Preset, [Nullable[datetime]]$CustomStartLocal, [Nullable[datetime]]$CustomEndLocal)
+    $nowUtc = [DateTime]::UtcNow
+    switch ($Preset) {
+        'Last 30 minutes' { return @{ StartUtc = $nowUtc.AddMinutes(-30); EndUtc = $nowUtc } }
+        'Last 1 hour'     { return @{ StartUtc = $nowUtc.AddHours(-1);    EndUtc = $nowUtc } }
+        'Last 4 hours'    { return @{ StartUtc = $nowUtc.AddHours(-4);    EndUtc = $nowUtc } }
+        'Last 24 hours'   { return @{ StartUtc = $nowUtc.AddHours(-24);   EndUtc = $nowUtc } }
+        'Custom'          {
+            return @{ StartUtc = $CustomStartLocal.Value.ToUniversalTime(); EndUtc = $CustomEndLocal.Value.ToUniversalTime() }
+        }
+        default { return @{ StartUtc = $nowUtc.AddMinutes(-30); EndUtc = $nowUtc } }
+    }
+}
+
+function Test-QueryStoreEnabled {
+    param([string]$ConnectionString)
+    $conn = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
+    try {
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = $script:SqlIsQueryStoreOn
+        $cmd.CommandTimeout = 10
+        $reader = $cmd.ExecuteReader()
+        try {
+            if ($reader.Read()) {
+                $state = $reader['actual_state_desc']
+                return ($state -and $state -ne 'OFF')
+            }
+            return $false   # no row in sys.database_query_store_options => QS never configured
+        } finally { $reader.Close() }
+    }
+    catch {
+        # Older compat level, permissions issue, etc. Treat as "unknown / off"
+        # and let the caller fall back to the plan-cache path.
+        return $false
+    }
+    finally { $conn.Close() }
+}
+
+# Lists ONLINE databases on the server this connection string points at
+# (Database key omitted -- see New-SqlConnectionString). sys.databases is
+# a server-scoped catalog view, so this works regardless of which
+# database the login happens to default into.
+function Get-ServerDatabases {
+    param([string]$ConnectionString)
+    $conn = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
+    try {
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT name FROM sys.databases WHERE state_desc = 'ONLINE' ORDER BY name;"
+        $cmd.CommandTimeout = 10
+        $reader = $cmd.ExecuteReader()
+        try {
+            $names = New-Object System.Collections.Generic.List[string]
+            while ($reader.Read()) { $names.Add([string]$reader['name']) }
+            return @($names)
+        } finally { $reader.Close() }
+    }
+    finally { $conn.Close() }
+}
+
+# Builds a strongly-typed SqlParameter. We deliberately do NOT use
+# Parameters.AddWithValue here: AddWithValue infers the SQL type from the
+# .NET value, and a $null search value (very common here -- e.g. @QueryId
+# when the user searched by proc name instead) gives it nothing to infer
+# from, which can produce a parameter of the wrong SqlDbType. Always
+# setting the type explicitly avoids that class of "operand type clash" /
+# unexpected-implicit-conversion bug regardless of which fields are null.
+function New-SqlParam {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [System.Data.SqlDbType]$Type,
+        $Value,
+        [int]$Size = 0
+    )
+    $p = New-Object System.Data.SqlClient.SqlParameter
+    $p.ParameterName = $Name
+    $p.SqlDbType = $Type
+    if ($Size -gt 0) { $p.Size = $Size }
+    $p.Value = if ($null -eq $Value) { [DBNull]::Value } else { $Value }
+    return $p
+}
+
+# Runs $CommandText against $ConnectionString with an array of SqlParameter
+# objects (build them with New-SqlParam) and returns a System.Data.DataSet
+# (one table per SQL result set). Kept here for programmatic/console use;
+# the GUI's async search path uses its own copy of this logic because it
+# runs in an isolated runspace that does not see this script's functions.
+function Invoke-HistoryQuery {
+    param(
+        [Parameter(Mandatory)] [string]$ConnectionString,
+        [Parameter(Mandatory)] [string]$CommandText,
+        [Parameter(Mandatory)] [System.Data.SqlClient.SqlParameter[]]$Parameters,
+        [int]$TimeoutSec = 30
+    )
+    $conn = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
+    $cmd  = $conn.CreateCommand()
+    $cmd.CommandText    = $CommandText
+    $cmd.CommandTimeout = $TimeoutSec
+    [void]$cmd.Parameters.AddRange($Parameters)
+    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+    $dataSet = New-Object System.Data.DataSet
+    try {
+        $conn.Open()
+        [void]$adapter.Fill($dataSet)
+    }
+    finally {
+        $conn.Close()
+    }
+    return $dataSet
+}
+
+# Runs a single non-query SQL statement (EXEC/DBCC) synchronously against
+# $ConnectionString with the given parameters. Used for the Remove Plan
+# feature: those calls are quick (metadata-only, like everything else in
+# this tool), and doing them synchronously means the confirm-dialog ->
+# run -> success/fail flow stays simple and immediate.
+function Invoke-HistoryCommand {
+    param(
+        [Parameter(Mandatory)] [string]$ConnectionString,
+        [Parameter(Mandatory)] [string]$CommandText,
+        [System.Data.SqlClient.SqlParameter[]]$Parameters = @(),
+        [int]$TimeoutSec = 30
+    )
+    $conn = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
+    $cmd  = $conn.CreateCommand()
+    $cmd.CommandText    = $CommandText
+    $cmd.CommandTimeout = $TimeoutSec
+    if ($Parameters.Count -gt 0) { [void]$cmd.Parameters.AddRange($Parameters) }
+    try {
+        $conn.Open()
+        [void]$cmd.ExecuteNonQuery()
+    }
+    finally {
+        $conn.Close()
+    }
+}
+
+# Small modal "pick one" dialog, used when a search turns up more than one
+# plan to choose from. $Items is an array of @{ Text = '...'; Value = ... }.
+# Returns the chosen item's Value, or $null if the user canceled.
+function Show-PickerDialog {
+    param(
+        [Parameter(Mandatory)] [string]$Title,
+        [Parameter(Mandatory)] [string]$Prompt,
+        [Parameter(Mandatory)] [array]$Items
+    )
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $Title
+    $dlg.Size = New-Object System.Drawing.Size(440, 340)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Prompt
+    $lbl.Location = New-Object System.Drawing.Point(10, 10)
+    $lbl.Size = New-Object System.Drawing.Size(405, 20)
+
+    $lst = New-Object System.Windows.Forms.ListBox
+    $lst.Location = New-Object System.Drawing.Point(10, 35)
+    $lst.Size = New-Object System.Drawing.Size(405, 220)
+    foreach ($item in $Items) { [void]$lst.Items.Add($item.Text) }
+    if ($lst.Items.Count -gt 0) { $lst.SelectedIndex = 0 }
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = 'OK'
+    $btnOk.Location = New-Object System.Drawing.Point(245, 265)
+    $btnOk.Size = New-Object System.Drawing.Size(80, 28)
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Cancel'
+    $btnCancel.Location = New-Object System.Drawing.Point(335, 265)
+    $btnCancel.Size = New-Object System.Drawing.Size(80, 28)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $dlg.Controls.AddRange(@($lbl, $lst, $btnOk, $btnCancel))
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+
+    $result = $dlg.ShowDialog()
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $lst.SelectedIndex -ge 0) {
+        return $Items[$lst.SelectedIndex].Value
+    }
+    return $null
+}
+
+# Fire-and-poll async runner so the UI thread never blocks on the SQL call.
+# Keeps the timer alive in $script:ActiveTimers until it fires.
+$script:ActiveTimers = New-Object System.Collections.ArrayList
+
+function Invoke-Async {
+    param(
+        [Parameter(Mandatory)] [scriptblock]$Work,
+        [array]$ArgumentList = @(),
+        [Parameter(Mandatory)] [scriptblock]$OnComplete
+    )
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $runspace
+    [void]$ps.AddScript($Work)
+    foreach ($arg in $ArgumentList) { [void]$ps.AddArgument($arg) }
+    $handle = $ps.BeginInvoke()
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 150
+    # OnComplete is stashed on $timer.Tag (not just closed over) on purpose:
+    # $OnComplete is a local parameter of THIS function call, and this
+    # function returns immediately after $timer.Start(). A plain scriptblock
+    # referencing $OnComplete would find it gone by the time Tick fires
+    # later -- that's the "expression after '&' ... not valid" / "It must
+    # result in a command name, a script block" error. Reading it back off
+    # $sender.Tag each tick sidesteps PowerShell scoping entirely.
+    $timer.Tag = [pscustomobject]@{ PS = $ps; Runspace = $runspace; Handle = $handle; OnComplete = $OnComplete }
+    $timer.Add_Tick({
+        param($sender, $e)
+        $state = $sender.Tag
+        if ($state.Handle.IsCompleted) {
+            $sender.Stop()
+            [void]$script:ActiveTimers.Remove($sender)
+            try {
+                $result = $state.PS.EndInvoke($state.Handle)
+                if ($state.PS.HadErrors) {
+                    $errText = ($state.PS.Streams.Error | ForEach-Object { $_.ToString() }) -join "`r`n"
+                    & $state.OnComplete $null $errText
+                } else {
+                    & $state.OnComplete $result $null
+                }
+            }
+            catch {
+                & $state.OnComplete $null $_.Exception.Message
+            }
+            finally {
+                $state.PS.Dispose()
+                $state.Runspace.Close()
+            }
+        }
+    })
+    [void]$script:ActiveTimers.Add($timer)
+    $timer.Start()
+}
+
+#endregion
+
+#region ------------------------------- GUI ------------------------------------
+
+$form                     = New-Object System.Windows.Forms.Form
+$form.Text                = 'Query Execution History'
+$form.Size                = New-Object System.Drawing.Size(1180, 760)
+$form.StartPosition       = 'CenterScreen'
+$form.MinimumSize         = New-Object System.Drawing.Size(900, 600)
+
+# --- Connection group -----------------------------------------------------
+$grpConn = New-Object System.Windows.Forms.GroupBox
+$grpConn.Text = 'Connection'
+$grpConn.Location = New-Object System.Drawing.Point(10, 10)
+$grpConn.Size = New-Object System.Drawing.Size(1145, 90)
+$grpConn.Anchor = 'Top,Left,Right'
+
+$lblServer = New-Object System.Windows.Forms.Label
+$lblServer.Text = 'Server\Instance:'
+$lblServer.Location = New-Object System.Drawing.Point(10, 25)
+$lblServer.AutoSize = $true
+
+$txtServer = New-Object System.Windows.Forms.TextBox
+$txtServer.Location = New-Object System.Drawing.Point(120, 22)
+$txtServer.Size = New-Object System.Drawing.Size(220, 22)
+$txtServer.Text = 'localhost'
+
+$lblDatabase = New-Object System.Windows.Forms.Label
+$lblDatabase.Text = 'Database:'
+$lblDatabase.Location = New-Object System.Drawing.Point(355, 25)
+$lblDatabase.AutoSize = $true
+
+# Editable ComboBox, not a plain TextBox: leave it blank and click Connect
+# to list every database on the server instead (see the Connect handler),
+# which fills this dropdown -- and caches the list per-server in
+# QueryExecutionHistory.databases.json so switching back to a server you
+# already listed pre-fills the dropdown immediately (Add_Leave below),
+# no live query needed until you want a refresh.
+$txtDatabase = New-Object System.Windows.Forms.ComboBox
+$txtDatabase.Location = New-Object System.Drawing.Point(430, 22)
+$txtDatabase.Size = New-Object System.Drawing.Size(200, 22)
+$txtDatabase.DropDownStyle = 'DropDown'
+$txtDatabase.AutoCompleteMode = 'SuggestAppend'
+$txtDatabase.AutoCompleteSource = 'ListItems'
+Set-Placeholder -Control $txtDatabase -Text 'blank = list databases on Connect'
+
+$txtServer.Add_Leave({
+    $srv = $txtServer.Text.Trim()
+    if ($srv -and $script:DatabaseCache -and $script:DatabaseCache.ContainsKey($srv)) {
+        $current = $txtDatabase.Text
+        $txtDatabase.Items.Clear()
+        [void]$txtDatabase.Items.AddRange(@($script:DatabaseCache[$srv]))
+        $txtDatabase.Text = $current
+    }
+})
+
+$radioWinAuth = New-Object System.Windows.Forms.RadioButton
+$radioWinAuth.Text = 'Windows Auth'
+$radioWinAuth.Location = New-Object System.Drawing.Point(650, 23)
+$radioWinAuth.AutoSize = $true
+$radioWinAuth.Checked = $true
+
+$radioSqlAuth = New-Object System.Windows.Forms.RadioButton
+$radioSqlAuth.Text = 'SQL Auth'
+$radioSqlAuth.Location = New-Object System.Drawing.Point(650, 48)
+$radioSqlAuth.AutoSize = $true
+
+$txtSqlUser = New-Object System.Windows.Forms.TextBox
+$txtSqlUser.Location = New-Object System.Drawing.Point(760, 22)
+$txtSqlUser.Size = New-Object System.Drawing.Size(140, 22)
+$txtSqlUser.Enabled = $false
+Set-Placeholder -Control $txtSqlUser -Text 'SQL login'
+
+$txtSqlPassword = New-Object System.Windows.Forms.TextBox
+$txtSqlPassword.Location = New-Object System.Drawing.Point(760, 47)
+$txtSqlPassword.Size = New-Object System.Drawing.Size(140, 22)
+$txtSqlPassword.Enabled = $false
+$txtSqlPassword.UseSystemPasswordChar = $true
+Set-Placeholder -Control $txtSqlPassword -Text 'Password'
+
+$radioWinAuth.Add_CheckedChanged({
+    $txtSqlUser.Enabled = -not $radioWinAuth.Checked
+    $txtSqlPassword.Enabled = -not $radioWinAuth.Checked
+})
+
+$btnConnect = New-Object System.Windows.Forms.Button
+$btnConnect.Text = 'Connect'
+$btnConnect.Location = New-Object System.Drawing.Point(920, 22)
+$btnConnect.Size = New-Object System.Drawing.Size(90, 46)
+
+$lblQsState = New-Object System.Windows.Forms.Label
+$lblQsState.Text = 'Not connected'
+$lblQsState.Location = New-Object System.Drawing.Point(1020, 30)
+$lblQsState.AutoSize = $true
+$lblQsState.ForeColor = [System.Drawing.Color]::DimGray
+
+$grpConn.Controls.AddRange(@($lblServer,$txtServer,$lblDatabase,$txtDatabase,$radioWinAuth,$radioSqlAuth,$txtSqlUser,$txtSqlPassword,$btnConnect,$lblQsState))
+
+# --- Search / time range group --------------------------------------------
+$grpSearch = New-Object System.Windows.Forms.GroupBox
+$grpSearch.Text = 'Search'
+$grpSearch.Location = New-Object System.Drawing.Point(10, 108)
+$grpSearch.Size = New-Object System.Drawing.Size(1145, 120)
+$grpSearch.Anchor = 'Top,Left,Right'
+
+$lblSearch = New-Object System.Windows.Forms.Label
+$lblSearch.Text = 'Query ID / Proc name:'
+$lblSearch.Location = New-Object System.Drawing.Point(10, 25)
+$lblSearch.AutoSize = $true
+
+# A ComboBox rather than a plain TextBox so it doubles as a "recent
+# searches" picker: typing works exactly like before (.Text is read the
+# same way), and the dropdown arrow lists your past search terms, most
+# recent first, loaded from/saved to a small JSON file next to this
+# script (see Import-SearchHistory / Export-SearchHistory below) -- that
+# file IS the "cache of proc names / query ids you've searched".
+$txtSearch = New-Object System.Windows.Forms.ComboBox
+$txtSearch.Location = New-Object System.Drawing.Point(160, 22)
+$txtSearch.Size = New-Object System.Drawing.Size(260, 22)
+$txtSearch.DropDownStyle = 'DropDown'
+$txtSearch.AutoCompleteMode = 'SuggestAppend'
+$txtSearch.AutoCompleteSource = 'ListItems'
+Set-Placeholder -Control $txtSearch -Text 'e.g. 224  or  dbo.usp_GetOrders  (blank = top queries)'
+
+$lblRange = New-Object System.Windows.Forms.Label
+$lblRange.Text = 'Time range:'
+$lblRange.Location = New-Object System.Drawing.Point(440, 25)
+$lblRange.AutoSize = $true
+
+$cmbRange = New-Object System.Windows.Forms.ComboBox
+$cmbRange.Location = New-Object System.Drawing.Point(520, 22)
+$cmbRange.Size = New-Object System.Drawing.Size(150, 22)
+$cmbRange.DropDownStyle = 'DropDownList'
+[void]$cmbRange.Items.AddRange(@('Last 30 minutes','Last 1 hour','Last 4 hours','Last 24 hours','Custom'))
+$cmbRange.SelectedIndex = 0
+
+$dtCustomStart = New-Object System.Windows.Forms.DateTimePicker
+$dtCustomStart.Location = New-Object System.Drawing.Point(680, 22)
+$dtCustomStart.Size = New-Object System.Drawing.Size(150, 22)
+$dtCustomStart.Format = 'Custom'
+$dtCustomStart.CustomFormat = 'yyyy-MM-dd HH:mm'
+$dtCustomStart.Enabled = $false
+
+$lblTo = New-Object System.Windows.Forms.Label
+$lblTo.Text = 'to'
+$lblTo.Location = New-Object System.Drawing.Point(835, 25)
+$lblTo.AutoSize = $true
+
+$dtCustomEnd = New-Object System.Windows.Forms.DateTimePicker
+$dtCustomEnd.Location = New-Object System.Drawing.Point(855, 22)
+$dtCustomEnd.Size = New-Object System.Drawing.Size(150, 22)
+$dtCustomEnd.Format = 'Custom'
+$dtCustomEnd.CustomFormat = 'yyyy-MM-dd HH:mm'
+$dtCustomEnd.Enabled = $false
+
+$cmbRange.Add_SelectedIndexChanged({
+    $isCustom = ($cmbRange.SelectedItem -eq 'Custom')
+    $dtCustomStart.Enabled = $isCustom
+    $dtCustomEnd.Enabled = $isCustom
+})
+
+$btnSearch = New-Object System.Windows.Forms.Button
+$btnSearch.Text = 'Search'
+$btnSearch.Location = New-Object System.Drawing.Point(1020, 20)
+$btnSearch.Size = New-Object System.Drawing.Size(90, 26)
+$btnSearch.Enabled = $false
+
+$lblStatus = New-Object System.Windows.Forms.Label
+$lblStatus.Text = ''
+$lblStatus.Location = New-Object System.Drawing.Point(10, 60)
+$lblStatus.AutoSize = $true
+$lblStatus.ForeColor = [System.Drawing.Color]::DarkSlateGray
+
+# Removes/evicts a plan from whichever backend answered the last search.
+# Query Store ON  -> sp_query_store_remove_plan (pick a plan_id if the
+#                    query has more than one; goes straight through if
+#                    there's only one).
+# Query Store OFF -> DBCC FREEPROCCACHE(plan_handle) -- the plan-cache
+#                    equivalent of "remove this one plan". Needs its own
+#                    plan_handle picker for the same reason.
+# Disabled until a search has returned rows; text/behavior below switches
+# on $script:QueryStoreOn. Both paths are destructive (force a recompile)
+# and always confirm before running -- see the Add_Click handler.
+$btnRemovePlan = New-Object System.Windows.Forms.Button
+$btnRemovePlan.Text = 'Remove Plan...'
+$btnRemovePlan.Location = New-Object System.Drawing.Point(10, 90)
+$btnRemovePlan.Size = New-Object System.Drawing.Size(190, 26)
+$btnRemovePlan.Enabled = $false
+
+# Query Store only -- the plan cache has no concept of "force this plan",
+# so this stays disabled outside Query Store mode rather than trying to
+# fake an equivalent. Doubles as Unforce: it reads is_forced_plan off the
+# plan you pick and offers whichever action applies (see Add_Click below).
+$btnForcePlan = New-Object System.Windows.Forms.Button
+$btnForcePlan.Text = 'Force Plan...'
+$btnForcePlan.Location = New-Object System.Drawing.Point(210, 90)
+$btnForcePlan.Size = New-Object System.Drawing.Size(190, 26)
+$btnForcePlan.Enabled = $false
+
+$lblRemovePlanHint = New-Object System.Windows.Forms.Label
+$lblRemovePlanHint.Text = ''
+$lblRemovePlanHint.Location = New-Object System.Drawing.Point(410, 96)
+$lblRemovePlanHint.AutoSize = $true
+$lblRemovePlanHint.ForeColor = [System.Drawing.Color]::DimGray
+
+$grpSearch.Controls.AddRange(@($lblSearch,$txtSearch,$lblRange,$cmbRange,$dtCustomStart,$lblTo,$dtCustomEnd,$btnSearch,$lblStatus,$btnRemovePlan,$btnForcePlan,$lblRemovePlanHint))
+
+# --- Results grid + detail split -------------------------------------------
+$splitMain = New-Object System.Windows.Forms.SplitContainer
+$splitMain.Location = New-Object System.Drawing.Point(10, 235)
+$splitMain.Size = New-Object System.Drawing.Size(1145, 475)
+$splitMain.Anchor = 'Top,Bottom,Left,Right'
+$splitMain.Orientation = 'Horizontal'
+$splitMain.SplitterDistance = 280
+
+$grid = New-Object System.Windows.Forms.DataGridView
+$grid.Dock = 'Fill'
+$grid.ReadOnly = $true
+$grid.AllowUserToAddRows = $false
+$grid.AllowUserToDeleteRows = $false
+$grid.AutoSizeColumnsMode = 'AllCells'
+$grid.SelectionMode = 'FullRowSelect'
+$grid.RowHeadersVisible = $false
+
+# --- Top pane: Grid view + Chart view, same result set, switchable ---------
+$tabResults = New-Object System.Windows.Forms.TabControl
+$tabResults.Dock = 'Fill'
+
+$tabGridPage = New-Object System.Windows.Forms.TabPage
+$tabGridPage.Text = 'Grid'
+$tabGridPage.Controls.Add($grid)
+[void]$tabResults.TabPages.Add($tabGridPage)
+
+# One bar per query, colored distinctly, like Query Store's "Top Resource
+# Consuming Queries" view -- built with the in-box .NET Chart control so
+# there is nothing extra to install. Works identically whether the data
+# came from Query Store or the plan-cache fallback: Update-Chart (defined
+# in the State + wiring region below) reads whatever columns are present.
+if ($script:ChartAvailable) {
+    $tabChartPage = New-Object System.Windows.Forms.TabPage
+    $tabChartPage.Text = 'Top Queries'
+
+    $pnlChartTop = New-Object System.Windows.Forms.Panel
+    $pnlChartTop.Dock = 'Top'
+    $pnlChartTop.Height = 34
+
+    $lblMetric = New-Object System.Windows.Forms.Label
+    $lblMetric.Text = 'Metric:'
+    $lblMetric.Location = New-Object System.Drawing.Point(10, 9)
+    $lblMetric.AutoSize = $true
+
+    $cmbMetric = New-Object System.Windows.Forms.ComboBox
+    $cmbMetric.DropDownStyle = 'DropDownList'
+    $cmbMetric.Location = New-Object System.Drawing.Point(70, 5)
+    $cmbMetric.Size = New-Object System.Drawing.Size(170, 22)
+    [void]$cmbMetric.Items.AddRange(@('Avg Duration (ms)', 'Avg CPU (ms)', 'Executions', 'Avg Logical Reads'))
+    $cmbMetric.SelectedIndex = 0
+    # Update-Chart is defined later (State + wiring region) but that's fine:
+    # this handler only runs on a later user click, by which point the
+    # whole script -- including Update-Chart's definition -- has finished
+    # loading. Re-chart from the last result set; no new SQL query needed.
+    $cmbMetric.Add_SelectedIndexChanged({
+        if ($script:LastResultTable) { Update-Chart -Table $script:LastResultTable -Metric $cmbMetric.SelectedItem }
+    })
+
+    $lblChartHint = New-Object System.Windows.Forms.Label
+    $lblChartHint.Text = '(top 25 shown; hover a bar for details)'
+    $lblChartHint.Location = New-Object System.Drawing.Point(255, 9)
+    $lblChartHint.AutoSize = $true
+    $lblChartHint.ForeColor = [System.Drawing.Color]::DimGray
+
+    $pnlChartTop.Controls.AddRange(@($lblMetric, $cmbMetric, $lblChartHint))
+
+    $chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
+    $chart.Dock = 'Fill'
+    $chartArea = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea
+    $chartArea.AxisX.LabelStyle.Angle = -45
+    $chartArea.AxisX.Interval = 1
+    $chartArea.AxisY.Title = 'Avg Duration (ms)'
+    $chartArea.AxisY.MajorGrid.LineColor = [System.Drawing.Color]::Gainsboro
+    [void]$chart.ChartAreas.Add($chartArea)
+
+    $tabChartPage.Controls.Add($chart)
+    $tabChartPage.Controls.Add($pnlChartTop)
+    [void]$tabResults.TabPages.Add($tabChartPage)
+
+    # --- Timeline tab: scatter of duration-over-time, one series (color)
+    # per plan, same shape as Query Store's own "Tracked Queries" chart.
+    # Query Store only -- see the SqlQueryStoreTimeline comment above for
+    # why the plan-cache fallback can't draw this one.
+    $tabTimelinePage = New-Object System.Windows.Forms.TabPage
+    $tabTimelinePage.Text = 'Timeline'
+
+    $pnlTimelineTop = New-Object System.Windows.Forms.Panel
+    $pnlTimelineTop.Dock = 'Top'
+    $pnlTimelineTop.Height = 34
+
+    $lblTlMetric = New-Object System.Windows.Forms.Label
+    $lblTlMetric.Text = 'Metric:'
+    $lblTlMetric.Location = New-Object System.Drawing.Point(10, 9)
+    $lblTlMetric.AutoSize = $true
+
+    $cmbTlMetric = New-Object System.Windows.Forms.ComboBox
+    $cmbTlMetric.DropDownStyle = 'DropDownList'
+    $cmbTlMetric.Location = New-Object System.Drawing.Point(70, 5)
+    $cmbTlMetric.Size = New-Object System.Drawing.Size(170, 22)
+    [void]$cmbTlMetric.Items.AddRange(@('Avg Duration (ms)', 'Avg CPU (ms)', 'Executions', 'Avg Logical Reads'))
+    $cmbTlMetric.SelectedIndex = 0
+    $cmbTlMetric.Add_SelectedIndexChanged({
+        if ($script:LastTimelineTable) { Update-Timeline -Table $script:LastTimelineTable -Metric $cmbTlMetric.SelectedItem }
+    })
+
+    $lblTlHint = New-Object System.Windows.Forms.Label
+    $lblTlHint.Text = '(Query Store only; one color per plan, like Query Store''s Tracked Queries view)'
+    $lblTlHint.Location = New-Object System.Drawing.Point(255, 9)
+    $lblTlHint.AutoSize = $true
+    $lblTlHint.ForeColor = [System.Drawing.Color]::DimGray
+
+    $pnlTimelineTop.Controls.AddRange(@($lblTlMetric, $cmbTlMetric, $lblTlHint))
+
+    $chartTimeline = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
+    $chartTimeline.Dock = 'Fill'
+    $chartTimelineArea = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea
+    $chartTimelineArea.AxisX.LabelStyle.Format = 'h:mm tt'
+    $chartTimelineArea.AxisX.IntervalType = [System.Windows.Forms.DataVisualization.Charting.DateTimeIntervalType]::Minutes
+    $chartTimelineArea.AxisY.Title = 'Avg Duration (ms)'
+    $chartTimelineArea.AxisY.MajorGrid.LineColor = [System.Drawing.Color]::Gainsboro
+    [void]$chartTimeline.ChartAreas.Add($chartTimelineArea)
+
+    $legendTimeline = New-Object System.Windows.Forms.DataVisualization.Charting.Legend
+    $legendTimeline.Title = 'Plan Id'
+    $legendTimeline.Docking = [System.Windows.Forms.DataVisualization.Charting.Docking]::Right
+    [void]$chartTimeline.Legends.Add($legendTimeline)
+
+    $tabTimelinePage.Controls.Add($chartTimeline)
+    $tabTimelinePage.Controls.Add($pnlTimelineTop)
+    [void]$tabResults.TabPages.Add($tabTimelinePage)
+}
+
+$tabDetail = New-Object System.Windows.Forms.TabControl
+$tabDetail.Dock = 'Fill'
+
+$tabText = New-Object System.Windows.Forms.TabPage
+$tabText.Text = 'Query Text'
+$txtQueryText = New-Object System.Windows.Forms.TextBox
+$txtQueryText.Multiline = $true
+$txtQueryText.ReadOnly = $true
+$txtQueryText.ScrollBars = 'Both'
+$txtQueryText.Dock = 'Fill'
+$txtQueryText.Font = New-Object System.Drawing.Font('Consolas', 9)
+$tabText.Controls.Add($txtQueryText)
+
+$tabPlan = New-Object System.Windows.Forms.TabPage
+$tabPlan.Text = 'Execution Plan (XML)'
+$txtPlanXml = New-Object System.Windows.Forms.TextBox
+$txtPlanXml.Multiline = $true
+$txtPlanXml.ReadOnly = $true
+$txtPlanXml.ScrollBars = 'Both'
+$txtPlanXml.Dock = 'Fill'
+$txtPlanXml.Font = New-Object System.Drawing.Font('Consolas', 8)
+$btnSavePlan = New-Object System.Windows.Forms.Button
+$btnSavePlan.Text = 'Save as .sqlplan...'
+$btnSavePlan.Dock = 'Bottom'
+$btnSavePlan.Height = 30
+$tabPlan.Controls.Add($txtPlanXml)
+$tabPlan.Controls.Add($btnSavePlan)
+
+[void]$tabDetail.TabPages.Add($tabText)
+[void]$tabDetail.TabPages.Add($tabPlan)
+
+$splitMain.Panel1.Controls.Add($tabResults)
+$splitMain.Panel2.Controls.Add($tabDetail)
+
+$form.Controls.AddRange(@($grpConn,$grpSearch,$splitMain))
+
+#endregion
+
+#region --------------------------- State + wiring -----------------------------
+
+$script:ConnectionString = $null
+$script:QueryStoreOn     = $false
+$script:RowCap           = 500
+$script:CommandTimeoutSec = 30
+$script:LastResultTable  = $null
+$script:LastTimelineTable = $null
+
+$script:SearchHistory = Import-SearchHistory
+$script:DatabaseCache = Import-DatabaseCache
+
+function Set-Status { param([string]$Text) $lblStatus.Text = $Text }
+
+# Distinct, colorblind-tolerant palette (borrowed from the common
+# "Tableau 10 / Vega category10"-style set) so each bar reads as its own
+# query at a glance, the same way Query Store colors each query in its
+# charts. Cycles if there are more rows than colors.
+$script:ChartPalette = @(
+    '#4C78A8','#F58518','#54A24B','#E45756','#72B7B2','#EECA3B',
+    '#B279A2','#FF9DA6','#9D755D','#BAB0AC','#5254A3','#8CA252'
+)
+
+# Redraws the Chart tab from whatever the last search returned. Works for
+# BOTH backends: Query Store rows carry query_id + count_executions,
+# plan-cache rows carry query_hash_hex + execution_count instead -- this
+# looks at whichever columns are actually present rather than assuming one
+# shape, so the exact same function serves both of the "two paths" this
+# tool was built around.
+function Update-Chart {
+    param([System.Data.DataTable]$Table, [string]$Metric = 'Avg Duration (ms)')
+
+    if (-not $script:ChartAvailable -or -not $chart) { return }
+    $chart.Series.Clear()
+    $chart.Titles.Clear()
+    if (-not $Table -or $Table.Rows.Count -eq 0) { return }
+
+    $execCountCol = if ($Table.Columns.Contains('count_executions')) { 'count_executions' } else { 'execution_count' }
+    $metricCol = switch ($Metric) {
+        'Executions'        { $execCountCol }
+        'Avg CPU (ms)'      { 'avg_cpu_ms' }
+        'Avg Logical Reads' { 'avg_logical_reads' }
+        default             { 'avg_duration_ms' }
+    }
+    if (-not $Table.Columns.Contains($metricCol)) { return }
+
+    $sortedRows = @($Table.Select('', "$metricCol DESC") | Select-Object -First 25)
+    if ($sortedRows.Count -eq 0) { return }
+
+    $series = New-Object System.Windows.Forms.DataVisualization.Charting.Series
+    $series.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Column
+    [void]$chart.Series.Add($series)
+    $chart.ChartAreas[0].AxisY.Title = $Metric
+
+    for ($i = 0; $i -lt $sortedRows.Count; $i++) {
+        $row = $sortedRows[$i]
+
+        $label =
+            if ($Table.Columns.Contains('proc_name') -and -not $row.IsNull('proc_name') -and $row['proc_name']) { [string]$row['proc_name'] }
+            elseif ($Table.Columns.Contains('query_id')) { "Query $($row['query_id'])" }
+            elseif ($Table.Columns.Contains('query_hash_hex') -and -not $row.IsNull('query_hash_hex') -and $row['query_hash_hex']) { [string]$row['query_hash_hex'] }
+            else { "Row $($i + 1)" }
+
+        $value = if ($row.IsNull($metricCol)) { 0 } else { [double]$row[$metricCol] }
+        $pointIndex = $series.Points.AddXY($label, $value)
+        $point = $series.Points[$pointIndex]
+        $point.Color = [System.Drawing.ColorTranslator]::FromHtml($script:ChartPalette[$i % $script:ChartPalette.Count])
+
+        $execCount = if ($Table.Columns.Contains($execCountCol) -and -not $row.IsNull($execCountCol)) { $row[$execCountCol] } else { 'n/a' }
+        $durMs     = if ($Table.Columns.Contains('avg_duration_ms') -and -not $row.IsNull('avg_duration_ms')) { $row['avg_duration_ms'] } else { 'n/a' }
+        $cpuMs     = if ($Table.Columns.Contains('avg_cpu_ms') -and -not $row.IsNull('avg_cpu_ms')) { $row['avg_cpu_ms'] } else { 'n/a' }
+        $point.ToolTip = "$label`nExecutions: $execCount`nAvg Duration: $durMs ms`nAvg CPU: $cpuMs ms"
+    }
+
+    [void]$chart.Titles.Add("Top $($sortedRows.Count) by $Metric")
+}
+
+# Redraws the Timeline tab: one scatter series per plan_id, X = interval end
+# time, Y = the selected metric -- this is what reproduces the screenshot
+# of Query Store's own "Tracked Queries" chart (dots over a time axis,
+# colored/legended by Plan Id). Only ever called with Query Store data;
+# there's no plan-cache equivalent (see the SqlQueryStoreTimeline comment).
+function Update-Timeline {
+    param([System.Data.DataTable]$Table, [string]$Metric = 'Avg Duration (ms)')
+
+    if (-not $script:ChartAvailable -or -not $chartTimeline) { return }
+    $chartTimeline.Series.Clear()
+    $chartTimeline.Titles.Clear()
+    if (-not $Table -or $Table.Rows.Count -eq 0) { return }
+
+    $metricCol = switch ($Metric) {
+        'Executions'        { 'count_executions' }
+        'Avg CPU (ms)'      { 'avg_cpu_ms' }
+        'Avg Logical Reads' { 'avg_logical_reads' }
+        default             { 'avg_duration_ms' }
+    }
+    $chartTimeline.ChartAreas[0].AxisY.Title = $Metric
+
+    $planGroups = $Table.Rows | Group-Object { $_['plan_id'] } | Sort-Object Name
+    $i = 0
+    foreach ($grp in $planGroups) {
+        $series = New-Object System.Windows.Forms.DataVisualization.Charting.Series "Plan $($grp.Name)"
+        $series.ChartType = [System.Windows.Forms.DataVisualization.Charting.SeriesChartType]::Point
+        $series.MarkerStyle = [System.Windows.Forms.DataVisualization.Charting.MarkerStyle]::Circle
+        $series.MarkerSize = 8
+        $series.XValueType = [System.Windows.Forms.DataVisualization.Charting.ChartValueType]::DateTime
+        $series.Color = [System.Drawing.ColorTranslator]::FromHtml($script:ChartPalette[$i % $script:ChartPalette.Count])
+        [void]$chartTimeline.Series.Add($series)
+
+        foreach ($row in ($grp.Group | Sort-Object { $_['interval_end_time'] })) {
+            # interval_end_time comes back from ADO.NET as a DateTimeOffset
+            # (it's a SQL datetimeoffset column) -- take .LocalDateTime
+            # explicitly rather than relying on an implicit cast, so the
+            # X axis shows your local wall-clock time.
+            $x = ([DateTimeOffset]$row['interval_end_time']).LocalDateTime
+            $y = if ($row.IsNull($metricCol)) { 0 } else { [double]$row[$metricCol] }
+            $pointIndex = $series.Points.AddXY($x, $y)
+            $point = $series.Points[$pointIndex]
+            $execCount = if (-not $row.IsNull('count_executions')) { $row['count_executions'] } else { 'n/a' }
+            $procName  = if (-not $row.IsNull('proc_name')) { [string]$row['proc_name'] } else { $null }
+            $label     = if ($procName) { $procName } else { "Query $($row['query_id'])" }
+            $point.ToolTip = "$label (Plan $($grp.Name))`n$($x.ToString('h:mm:ss tt'))`nExecutions: $execCount`n$Metric`: $y"
+        }
+        $i++
+    }
+
+    [void]$chartTimeline.Titles.Add("$($planGroups.Count) plan(s) over time")
+}
+
+$btnConnect.Add_Click({
+    if ([string]::IsNullOrWhiteSpace($txtServer.Text)) {
+        [System.Windows.Forms.MessageBox]::Show('Server is required.', 'Missing info', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $serverName = $txtServer.Text.Trim()
+    $dbName     = $txtDatabase.Text.Trim()
+
+    $btnConnect.Enabled = $false
+    $btnSearch.Enabled = $false
+
+    # Database left blank: connect at server level just to enumerate
+    # databases, populate the dropdown + on-disk cache, then stop --
+    # the user picks a database and clicks Connect again to do the real
+    # (per-database) connect + Query Store check below.
+    if ([string]::IsNullOrWhiteSpace($dbName)) {
+        $lblQsState.Text = 'Listing databases...'
+        $lblQsState.ForeColor = [System.Drawing.Color]::DimGray
+
+        $serverConnStr = New-SqlConnectionString -ServerName $serverName `
+            -UseSqlAuth:$radioSqlAuth.Checked -SqlUser $txtSqlUser.Text -SqlPassword $txtSqlPassword.Text
+
+        try {
+            $dbNames = Get-ServerDatabases -ConnectionString $serverConnStr
+            $currentText = $txtDatabase.Text
+            $txtDatabase.Items.Clear()
+            if ($dbNames -and $dbNames.Count -gt 0) { [void]$txtDatabase.Items.AddRange(@($dbNames)) }
+            $txtDatabase.Text = $currentText
+
+            if (-not $script:DatabaseCache) { $script:DatabaseCache = @{} }
+            $script:DatabaseCache[$serverName] = @($dbNames)
+            Export-DatabaseCache -Cache $script:DatabaseCache
+
+            $lblQsState.Text = "Found $($dbNames.Count) database(s). Pick one above, then click Connect again."
+            $lblQsState.ForeColor = [System.Drawing.Color]::SeaGreen
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show("Could not list databases:`r`n$($_.Exception.Message)", 'Connection failed', 'OK', 'Error') | Out-Null
+            $lblQsState.Text = 'Not connected'
+            $lblQsState.ForeColor = [System.Drawing.Color]::DimGray
+        }
+        finally {
+            $btnConnect.Enabled = $true
+        }
+        return
+    }
+
+    $lblQsState.Text = 'Connecting...'
+    $lblQsState.ForeColor = [System.Drawing.Color]::DimGray
+
+    $connStr = New-SqlConnectionString -ServerName $serverName -DatabaseName $dbName `
+        -UseSqlAuth:$radioSqlAuth.Checked -SqlUser $txtSqlUser.Text -SqlPassword $txtSqlPassword.Text
+
+    # Connectivity + "is Query Store on" check runs synchronously here: it is
+    # a single sub-second metadata call (SELECT actual_state_desc FROM
+    # sys.database_query_store_options), so a brief UI block is acceptable.
+    # The potentially slower part -- the actual history query -- always runs
+    # async via Invoke-Async in the Search handler below.
+    try {
+        $isOn = Test-QueryStoreEnabled -ConnectionString $connStr
+        $script:ConnectionString = $connStr
+        $script:QueryStoreOn = $isOn
+        if ($isOn) {
+            $lblQsState.Text = 'Query Store: ON'
+            $lblQsState.ForeColor = [System.Drawing.Color]::SeaGreen
+        } else {
+            $lblQsState.Text = 'Query Store: OFF (using plan cache)'
+            $lblQsState.ForeColor = [System.Drawing.Color]::DarkOrange
+        }
+        $btnSearch.Enabled = $true
+
+        if (-not $script:DatabaseCache) { $script:DatabaseCache = @{} }
+        $existing = if ($script:DatabaseCache.ContainsKey($serverName)) { @($script:DatabaseCache[$serverName]) } else { @() }
+        if ($existing -notcontains $dbName) {
+            $script:DatabaseCache[$serverName] = @($existing + $dbName) | Sort-Object -Unique
+            Export-DatabaseCache -Cache $script:DatabaseCache
+        }
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show("Could not connect:`r`n$($_.Exception.Message)", 'Connection failed', 'OK', 'Error') | Out-Null
+        $lblQsState.Text = 'Not connected'
+        $lblQsState.ForeColor = [System.Drawing.Color]::DimGray
+    }
+    finally {
+        $btnConnect.Enabled = $true
+    }
+})
+
+$btnSearch.Add_Click({
+    if (-not $script:ConnectionString) { return }
+
+    # Stashed at script scope (not a plain local) so the OnComplete handler
+    # below can read it reliably -- OnComplete actually runs later, from
+    # Invoke-Async's Tick handler, by which point this click handler's own
+    # local variables are gone. Same reasoning as $timer.Tag.OnComplete.
+    # The Enabled=$false on $btnSearch during a run rules out a second
+    # click clobbering this before OnComplete reads it.
+    $script:LastSearchText = $txtSearch.Text
+    $search = Resolve-SearchInput -Text $txtSearch.Text
+    $range = Get-TimeRangeUtc -Preset $cmbRange.SelectedItem -CustomStartLocal $dtCustomStart.Value -CustomEndLocal $dtCustomEnd.Value
+
+    $btnSearch.Enabled = $false
+    $grid.DataSource = $null
+    $txtQueryText.Text = ''
+    $txtPlanXml.Text = ''
+    Set-Status 'Running...'
+
+    $connStr      = $script:ConnectionString
+    $isQsOn       = $script:QueryStoreOn
+    $rowCap       = $script:RowCap
+    $timeoutSec   = $script:CommandTimeoutSec
+    $qsSql        = $script:SqlQueryStore
+    $pcSql        = $script:SqlPlanCache
+    $tlSql        = $script:SqlQueryStoreTimeline
+
+    Invoke-Async -Work {
+        param($connStr,$isQsOn,$rowCap,$timeoutSec,$qsSql,$pcSql,$tlSql,$search,$range)
+
+        Add-Type -AssemblyName System.Data
+
+        # Self-contained copies of New-SqlParam / Invoke-HistoryQuery: this
+        # scriptblock runs in its own isolated Runspace (via [powershell]::
+        # Create()), so it cannot see functions defined in the main script's
+        # scope -- only what's passed in via -ArgumentList.
+        function local:New-SqlParamInner {
+            param([string]$Name,[System.Data.SqlDbType]$Type,$Value,[int]$Size = 0)
+            $p = New-Object System.Data.SqlClient.SqlParameter
+            $p.ParameterName = $Name
+            $p.SqlDbType = $Type
+            if ($Size -gt 0) { $p.Size = $Size }
+            $p.Value = if ($null -eq $Value) { [DBNull]::Value } else { $Value }
+            return $p
+        }
+        function local:Invoke-HistoryQueryInner {
+            param($ConnectionString,$CommandText,[System.Data.SqlClient.SqlParameter[]]$Parameters,$TimeoutSec)
+            $conn = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
+            $cmd  = $conn.CreateCommand()
+            $cmd.CommandText    = $CommandText
+            $cmd.CommandTimeout = $TimeoutSec
+            [void]$cmd.Parameters.AddRange($Parameters)
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
+            $dataSet = New-Object System.Data.DataSet
+            try { $conn.Open(); [void]$adapter.Fill($dataSet) } finally { $conn.Close() }
+            return $dataSet
+        }
+
+        if ($isQsOn) {
+            $paramsQs = @(
+                (New-SqlParamInner -Name '@QueryId'  -Type Int            -Value $search.QueryId)
+                (New-SqlParamInner -Name '@ProcName' -Type NVarChar -Size 261 -Value $search.ProcName)
+                (New-SqlParamInner -Name '@StartUtc' -Type DateTimeOffset -Value ([DateTimeOffset]$range.StartUtc))
+                (New-SqlParamInner -Name '@EndUtc'   -Type DateTimeOffset -Value ([DateTimeOffset]$range.EndUtc))
+                (New-SqlParamInner -Name '@RowCap'   -Type Int            -Value $rowCap)
+            )
+            $ds = Invoke-HistoryQueryInner -ConnectionString $connStr -CommandText $qsSql -Parameters $paramsQs -TimeoutSec $timeoutSec
+
+            # Same filters, higher row cap (this is per plan-PER-INTERVAL,
+            # not one row per plan, so it needs more headroom) -- feeds the
+            # Timeline tab's scatter chart.
+            $paramsTl = @(
+                (New-SqlParamInner -Name '@QueryId'  -Type Int               -Value $search.QueryId)
+                (New-SqlParamInner -Name '@ProcName' -Type NVarChar -Size 261 -Value $search.ProcName)
+                (New-SqlParamInner -Name '@StartUtc' -Type DateTimeOffset    -Value ([DateTimeOffset]$range.StartUtc))
+                (New-SqlParamInner -Name '@EndUtc'   -Type DateTimeOffset    -Value ([DateTimeOffset]$range.EndUtc))
+                (New-SqlParamInner -Name '@RowCap'   -Type Int               -Value ([Math]::Max($rowCap, 2000)))
+            )
+            $dsTl = Invoke-HistoryQueryInner -ConnectionString $connStr -CommandText $tlSql -Parameters $paramsTl -TimeoutSec $timeoutSec
+
+            return [pscustomobject]@{ Mode = 'QueryStore'; DataSet = $ds; TimelineDataSet = $dsTl }
+        }
+        else {
+            $paramsPc = @(
+                (New-SqlParamInner -Name '@ProcName'   -Type NVarChar  -Size 261 -Value $search.ProcName)
+                (New-SqlParamInner -Name '@QueryHash'  -Type VarBinary -Size 8   -Value $search.QueryHash)
+                (New-SqlParamInner -Name '@StartLocal' -Type DateTime2          -Value $range.StartUtc.ToLocalTime())
+                (New-SqlParamInner -Name '@EndLocal'   -Type DateTime2          -Value $range.EndUtc.ToLocalTime())
+                (New-SqlParamInner -Name '@RowCap'     -Type Int                -Value $rowCap)
+            )
+            $ds = Invoke-HistoryQueryInner -ConnectionString $connStr -CommandText $pcSql -Parameters $paramsPc -TimeoutSec $timeoutSec
+            return [pscustomobject]@{ Mode = 'PlanCache'; DataSet = $ds }
+        }
+    } -ArgumentList @($connStr,$isQsOn,$rowCap,$timeoutSec,$qsSql,$pcSql,$tlSql,$search,$range) -OnComplete {
+        param($result, $errText)
+
+        $btnSearch.Enabled = $true
+
+        if ($errText) {
+            Set-Status 'Error.'
+            [System.Windows.Forms.MessageBox]::Show($errText, 'Query failed', 'OK', 'Error') | Out-Null
+            return
+        }
+
+        $payload = $result | Select-Object -Last 1
+        if (-not $payload) { Set-Status 'No result.'; return }
+
+        Add-SearchHistory -Text $script:LastSearchText
+
+        if ($payload.Mode -eq 'QueryStore') {
+            $table = $payload.DataSet.Tables[0]
+            $grid.DataSource = $table
+            Set-Status "Query Store mode -- $($table.Rows.Count) row(s)."
+        }
+        else {
+            $combined = $payload.DataSet.Tables[0].Copy()
+            if ($payload.DataSet.Tables.Count -gt 1) {
+                foreach ($row in $payload.DataSet.Tables[1].Rows) {
+                    [void]$combined.ImportRow($row)
+                }
+            }
+            $grid.DataSource = $combined
+            $table = $combined
+            Set-Status "Plan cache mode -- $($combined.Rows.Count) row(s). Volatile view: evicted plans won't appear."
+        }
+
+        if ($grid.Columns.Contains('query_plan_xml'))    { $grid.Columns['query_plan_xml'].Visible = $false }
+        if ($grid.Columns.Contains('plan_handle_hex'))   { $grid.Columns['plan_handle_hex'].Visible = $false }
+        if ($grid.Columns.Contains('query_sql_text'))    { $grid.Columns['query_sql_text'].Width = 260 }
+
+        $btnRemovePlan.Enabled = ($table.Rows.Count -gt 0)
+        $btnRemovePlan.Text = if ($payload.Mode -eq 'QueryStore') { 'Remove Plan...' } else { 'Free Plan (DBCC)...' }
+        $btnForcePlan.Enabled = ($payload.Mode -eq 'QueryStore' -and $table.Rows.Count -gt 0)
+        $lblRemovePlanHint.Text = if ($payload.Mode -eq 'QueryStore') {
+            'Remove/Force need db_owner.'
+        } else {
+            'DBCC FREEPROCCACHE needs ALTER SERVER STATE. Force Plan is Query Store only.'
+        }
+
+        $script:LastResultTable = $table
+        if ($script:ChartAvailable) {
+            Update-Chart -Table $table -Metric $cmbMetric.SelectedItem
+
+            if ($payload.Mode -eq 'QueryStore' -and $payload.TimelineDataSet -and $payload.TimelineDataSet.Tables.Count -gt 0) {
+                $script:LastTimelineTable = $payload.TimelineDataSet.Tables[0]
+                Update-Timeline -Table $script:LastTimelineTable -Metric $cmbTlMetric.SelectedItem
+            }
+            else {
+                # Plan cache mode: no time-series data exists to draw here.
+                $script:LastTimelineTable = $null
+                $chartTimeline.Series.Clear()
+                $chartTimeline.Titles.Clear()
+                [void]$chartTimeline.Titles.Add('Timeline needs Query Store to be ON -- plan cache has no history over time.')
+            }
+        }
+    }
+})
+
+$btnRemovePlan.Add_Click({
+    if (-not $script:LastResultTable -or $script:LastResultTable.Rows.Count -eq 0) { return }
+    $table = $script:LastResultTable
+
+    if ($script:QueryStoreOn) {
+        # --- Query Store: sp_query_store_remove_plan, by plan_id ----------
+        if (-not $table.Columns.Contains('plan_id')) { return }
+
+        $items = @{}
+        foreach ($row in $table.Rows) {
+            $planId = $row['plan_id']
+            if ($items.ContainsKey($planId)) { continue }
+            $label = if (-not $row.IsNull('proc_name') -and $row['proc_name']) { [string]$row['proc_name'] } else { "Query $($row['query_id'])" }
+            $dur   = if (-not $row.IsNull('avg_duration_ms')) { $row['avg_duration_ms'] } else { 0 }
+            $execs = if (-not $row.IsNull('count_executions')) { $row['count_executions'] } else { 0 }
+            $items[$planId] = "Plan $planId -- $label (avg $dur ms, $execs execs)"
+        }
+        $itemList = $items.Keys | Sort-Object | ForEach-Object { [pscustomobject]@{ Text = $items[$_]; Value = $_ } }
+
+        $selectedPlanId =
+            if (@($itemList).Count -eq 1) { $itemList[0].Value }
+            else { Show-PickerDialog -Title 'Remove Plan' -Prompt "This query has $(@($itemList).Count) plans. Choose one to remove from Query Store:" -Items $itemList }
+        if ($null -eq $selectedPlanId) { return }
+
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Remove plan $selectedPlanId from Query Store?`r`n`r`nThis discards its captured plan and stats. The query will recompile on its next execution. This cannot be undone.",
+            'Confirm Remove Plan', 'YesNo', 'Warning')
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        try {
+            $p = New-SqlParam -Name '@PlanId' -Type Int -Value $selectedPlanId
+            Invoke-HistoryCommand -ConnectionString $script:ConnectionString -CommandText 'EXEC sys.sp_query_store_remove_plan @PlanId;' -Parameters @($p)
+            Set-Status "Plan $selectedPlanId removed from Query Store."
+            [System.Windows.Forms.MessageBox]::Show("Plan $selectedPlanId removed. Re-run Search to refresh the results.", 'Done', 'OK', 'Information') | Out-Null
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show("Failed to remove plan $selectedPlanId`:`r`n$($_.Exception.Message)`r`n`r`nThis needs db_owner on the database.", 'Remove Plan failed', 'OK', 'Error') | Out-Null
+        }
+    }
+    else {
+        # --- No Query Store: DBCC FREEPROCCACHE(plan_handle) --------------
+        if (-not $table.Columns.Contains('plan_handle_hex')) { return }
+
+        $items = @{}
+        foreach ($row in $table.Rows) {
+            if ($row.IsNull('plan_handle_hex') -or -not $row['plan_handle_hex']) { continue }
+            $handleHex = [string]$row['plan_handle_hex']
+            if ($items.ContainsKey($handleHex)) { continue }
+            $label = if (-not $row.IsNull('proc_name') -and $row['proc_name']) { [string]$row['proc_name'] }
+                     elseif (-not $row.IsNull('query_hash_hex') -and $row['query_hash_hex']) { [string]$row['query_hash_hex'] }
+                     else { '(unnamed)' }
+            $dur = if (-not $row.IsNull('avg_duration_ms')) { $row['avg_duration_ms'] } else { 0 }
+            $items[$handleHex] = "$label (avg $dur ms) -- $($handleHex.Substring(0, [Math]::Min(20,$handleHex.Length)))..."
+        }
+        if ($items.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('No plan handle available for these rows.', 'Nothing to remove', 'OK', 'Information') | Out-Null
+            return
+        }
+        $itemList = $items.Keys | ForEach-Object { [pscustomobject]@{ Text = $items[$_]; Value = $_ } }
+
+        $selectedHandleHex =
+            if (@($itemList).Count -eq 1) { $itemList[0].Value }
+            else { Show-PickerDialog -Title 'Free Plan' -Prompt "$(@($itemList).Count) distinct cached plans in these results. Choose one to evict:" -Items $itemList }
+        if ($null -eq $selectedHandleHex) { return }
+
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Run DBCC FREEPROCCACHE on this one plan?`r`n`r`n$selectedHandleHex`r`n`r`nThis evicts it from the plan cache; the next execution recompiles. This cannot be undone.",
+            'Confirm Free Plan', 'YesNo', 'Warning')
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        try {
+            # Passed as a real varbinary parameter (not concatenated into the
+            # DBCC text) even though it's our own hex, so this stays
+            # consistent with how every other statement in this tool binds
+            # values -- and DBCC FREEPROCCACHE happily takes a variable.
+            # plan_handle_hex was produced by CONVERT(..., 1), which always
+            # emits a "0x" prefix followed by uppercase hex digits.
+            $hexDigits = $selectedHandleHex.Substring(2)
+            $bytes = New-Object byte[] ($hexDigits.Length / 2)
+            for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($hexDigits.Substring($i * 2, 2), 16) }
+
+            $p = New-SqlParam -Name '@PlanHandle' -Type VarBinary -Size 64 -Value $bytes
+            Invoke-HistoryCommand -ConnectionString $script:ConnectionString -CommandText 'DECLARE @ph VARBINARY(64) = @PlanHandle; DBCC FREEPROCCACHE(@ph);' -Parameters @($p)
+            Set-Status 'Plan freed from cache.'
+            [System.Windows.Forms.MessageBox]::Show('Plan evicted from cache. Re-run Search to refresh the results.', 'Done', 'OK', 'Information') | Out-Null
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show("Failed to free plan:`r`n$($_.Exception.Message)`r`n`r`nThis needs ALTER SERVER STATE permission.", 'Free Plan failed', 'OK', 'Error') | Out-Null
+        }
+    }
+})
+
+$btnForcePlan.Add_Click({
+    if (-not $script:QueryStoreOn) { return }   # button is disabled in this mode, but guard anyway
+    if (-not $script:LastResultTable -or $script:LastResultTable.Rows.Count -eq 0) { return }
+    $table = $script:LastResultTable
+    if (-not $table.Columns.Contains('plan_id') -or -not $table.Columns.Contains('query_id')) { return }
+
+    $items = @{}
+    foreach ($row in $table.Rows) {
+        $key = "$($row['query_id'])|$($row['plan_id'])"
+        if ($items.ContainsKey($key)) { continue }
+        $label   = if (-not $row.IsNull('proc_name') -and $row['proc_name']) { [string]$row['proc_name'] } else { "Query $($row['query_id'])" }
+        $dur     = if (-not $row.IsNull('avg_duration_ms')) { $row['avg_duration_ms'] } else { 0 }
+        $isForced = -not $row.IsNull('is_forced_plan') -and $row['is_forced_plan']
+        $tag = if ($isForced) { ' [CURRENTLY FORCED]' } else { '' }
+        $items[$key] = [pscustomobject]@{
+            Text     = "Query $($row['query_id']), Plan $($row['plan_id']) -- $label (avg $dur ms)$tag"
+            QueryId  = $row['query_id']
+            PlanId   = $row['plan_id']
+            IsForced = [bool]$isForced
+        }
+    }
+    $itemList = $items.Values | Sort-Object PlanId | ForEach-Object { [pscustomobject]@{ Text = $_.Text; Value = $_ } }
+
+    $picked =
+        if (@($itemList).Count -eq 1) { $itemList[0].Value }
+        else { Show-PickerDialog -Title 'Force Plan' -Prompt "Choose a (query, plan) pair:" -Items $itemList }
+    if ($null -eq $picked) { return }
+
+    if ($picked.IsForced) {
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Unforce plan $($picked.PlanId) for query $($picked.QueryId)?`r`n`r`nThe optimizer will go back to choosing its own plan for this query.",
+            'Confirm Unforce Plan', 'YesNo', 'Warning')
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        $sql = 'EXEC sys.sp_query_store_unforce_plan @query_id = @QueryId, @plan_id = @PlanId;'
+        $verb = 'unforced'
+    }
+    else {
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Force plan $($picked.PlanId) for query $($picked.QueryId)?`r`n`r`nThe optimizer will use this exact plan for every future execution of this query, until it's unforced or becomes invalid (e.g. after an index or schema change). Use Force Plan again on the same row to unforce it later.",
+            'Confirm Force Plan', 'YesNo', 'Warning')
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        $sql = 'EXEC sys.sp_query_store_force_plan @query_id = @QueryId, @plan_id = @PlanId;'
+        $verb = 'forced'
+    }
+
+    try {
+        $pQ = New-SqlParam -Name '@QueryId' -Type Int -Value $picked.QueryId
+        $pP = New-SqlParam -Name '@PlanId'  -Type Int -Value $picked.PlanId
+        Invoke-HistoryCommand -ConnectionString $script:ConnectionString -CommandText $sql -Parameters @($pQ, $pP)
+        Set-Status "Plan $($picked.PlanId) $verb for query $($picked.QueryId)."
+        [System.Windows.Forms.MessageBox]::Show("Plan $($picked.PlanId) $verb. Re-run Search to refresh the results.", 'Done', 'OK', 'Information') | Out-Null
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show("Failed to $($verb -replace 'ed$','e') plan:`r`n$($_.Exception.Message)`r`n`r`nThis needs db_owner on the database.", 'Force/Unforce Plan failed', 'OK', 'Error') | Out-Null
+    }
+})
+
+$grid.Add_SelectionChanged({
+    if ($grid.CurrentRow -and $grid.CurrentRow.DataBoundItem) {
+        $row = $grid.CurrentRow.DataBoundItem.Row
+        $txtQueryText.Text = if ($row.Table.Columns.Contains('query_sql_text') -and -not $row.IsNull('query_sql_text')) { $row['query_sql_text'] } else { '' }
+        $txtPlanXml.Text   = if ($row.Table.Columns.Contains('query_plan_xml') -and -not $row.IsNull('query_plan_xml')) { $row['query_plan_xml'] } else { '(no plan captured)' }
+    }
+})
+
+$btnSavePlan.Add_Click({
+    if ([string]::IsNullOrWhiteSpace($txtPlanXml.Text) -or $txtPlanXml.Text -eq '(no plan captured)') { return }
+    $sfd = New-Object System.Windows.Forms.SaveFileDialog
+    $sfd.Filter = 'SQL Plan (*.sqlplan)|*.sqlplan|All files (*.*)|*.*'
+    $sfd.FileName = 'plan.sqlplan'
+    if ($sfd.ShowDialog() -eq 'OK') {
+        [System.IO.File]::WriteAllText($sfd.FileName, $txtPlanXml.Text)
+    }
+})
+
+#endregion
+
+# Populating a ComboBox's Items in bulk (AddRange) BEFORE its window
+# handle exists -- which is what happens if this runs at top-level script
+# scope, since that's all before ShowDialog() -- leaves the native
+# Windows AutoComplete popup (AutoCompleteSource=ListItems) initialized
+# against a stale snapshot. It then renders wrong (items smashed onto one
+# row) the first time it pops up, even though the ComboBox's own
+# click-the-arrow dropdown looks fine. Populating instead once here, in
+# Shown (handle guaranteed to exist), matches how it already gets
+# refreshed correctly during active use (Add-SearchHistory runs well
+# after the form is visible) -- this is why the bug only showed up right
+# after a fresh launch, never after searching a few times in the same run.
+$form.Add_Shown({
+    if ($script:SearchHistory.Count -gt 0) { [void]$txtSearch.Items.AddRange($script:SearchHistory) }
+    if ($script:DatabaseCache -and $script:DatabaseCache.ContainsKey($txtServer.Text.Trim())) {
+        [void]$txtDatabase.Items.AddRange(@($script:DatabaseCache[$txtServer.Text.Trim()]))
+    }
+})
+
+[void]$form.ShowDialog()
