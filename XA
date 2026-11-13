@@ -1,270 +1,355 @@
 /*
-    Plan Regression Tracker - LITE - WINDOW 1: COLLECT
+    Plan Regression Tracker - LITE - WINDOW 2: DETECT + ALERT (PRINT only)
     -------------------------------------------------------------------------------------------
-    Run in the MONITORED database (primary or readable secondary). Read-only on the database:
-    it only SELECTs from Query Store views. Everything it keeps is in ## global temp tables
-    (tempdb), which Window 2 reads.
+    Run in the SAME monitored database as Window 1, in another window, whenever you want
+    (e.g. every few minutes). Reads the ## tables filled by Window 1; reads Query Store only for
+    the statement text and the two plans of a new alert. Nothing is written to the database.
 
-    KEEP THIS WINDOW OPEN. The ## tables disappear when this session disconnects.
-    Stop the loop with "Cancel Executing Query" (Alt+Break); the data stays while the window is open.
-    Re-running the script continues from where it stopped (it reuses the ## tables).
-
-    Needs: Query Store ON. Waits per plan need SQL Server 2017+ (skipped on 2016).
+    Output:
+      1. Messages tab: one PRINTed alert per NEW regression, and one line per RESOLVED one.
+      2. Result 1: every statement that ran in the current window, with the verdict (why it is / is not an alert).
+      3. Result 2: all events so far (##prt_Event).
 */
 SET NOCOUNT ON;
 SET LOCK_TIMEOUT 3000;
 SET DEADLOCK_PRIORITY LOW;
-SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-/* ======================= settings ======================= */
-DECLARE @BackfillHours        int = 24,     -- first cycle reads this far back (168 = 7 days; keep small on huge stores)
-        @MarginMin            int = 20,     -- only intervals that ENDED this many minutes ago (QS flush + AG redo). Local test: 0
-        @EveryMin             int = 5,      -- minutes between cycles
-        @Loop                 bit = 1,      -- 0 = run one cycle and stop
-        @ReReadIntervals      int = 2,      -- re-read the last N loaded intervals (late-flushed rows)
-        @MaxIntervalsPerCycle int = 16,     -- bounded catch-up per cycle
-        @TopN                 int = 200,    -- per interval keep top N statements by CPU and by reads...
-        @KeepMinCpuMs         int = 1000,   -- ...and any statement using >= this CPU (ms) in an interval
-        @MaxAvgRunnable       decimal(9,2) = 2,   -- skip the cycle when the server is busier than this
-        @MaxBlocked           int = 5;
-/* ======================================================== */
+/* ======================= settings (production defaults) ======================= */
+DECLARE @CurrentWindowMin     int   = 120,      -- "now" window (minutes)          local test: 15
+        @BaselineHours        int   = 168,      -- baseline = this many hours before the current window   local test: 24
+        @MinBaseExecs         bigint= 50,       --                                  local test: 5
+        @MinCurExecs          bigint= 20,       --                                  local test: 5
+        @NewPlanMinShare      float = 0.5,      -- new plan runs >= 50% of current executions
+        @NewPlanMaxBaseShare  float = 0.1,      -- ...and <= 10% of baseline executions
+        @ReadsRatio           float = 3,        -- reads/exec x3
+        @CpuRatio             float = 2,        -- CPU/exec x2 ...
+        @CpuMinDeltaMs        float = 50,       -- ... and +50 ms                   local test: 1
+        @WaitRatio            float = 3,        -- a wait category x3 ...
+        @WaitMinMs            float = 10,       -- ... and >= 10 ms/exec
+        @AbortDelta           float = 0.05,     -- timeouts/aborts share +5 points
+        @MinExtraCpuSecH      float = 30,       -- impact gates (any one)           local test: 0
+        @MinExtraWaitSecH     float = 60,       --                                  local test: 0
+        @MinExtraReadsH       float = 10000000, --                                  local test: 0
+        @ResolveRatio         float = 1.2,      -- resolved when within 1.2x of the frozen baseline ...
+        @ResolveMin           int   = 1440;     -- ... for this many minutes (or no executions)   local test: 30
+/* ============================================================================== */
 
-IF NOT EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state_desc IN (N'READ_WRITE', N'READ_ONLY', N'READ_CAPTURE_SECONDARY'))
+IF OBJECT_ID(N'tempdb..##prt_Interval') IS NULL OR OBJECT_ID(N'tempdb..##prt_State') IS NULL
 BEGIN
-    RAISERROR(N'Query Store is not ON in this database (run the script in the monitored database).', 16, 1);
+    RAISERROR(N'Start Window 1 first (it creates the ##prt_ tables), and keep it open.', 16, 1);
     RETURN;
 END;
-
-IF OBJECT_ID(N'tempdb..##prt_State') IS NULL
-    CREATE TABLE ##prt_State
-    (
-        DatabaseName          sysname       NOT NULL,
-        LastIntervalId        bigint        NULL,
-        LastIntervalStartUtc  datetime2(0)  NULL,
-        LastIntervalEndUtc    datetime2(0)  NULL,
-        Cycles                int           NOT NULL DEFAULT (0),
-        LastCycleUtc          datetime2(0)  NULL,
-        LastMessage           nvarchar(400) NULL
-    );
-IF OBJECT_ID(N'tempdb..##prt_Watch') IS NULL
-    CREATE TABLE ##prt_Watch (QueryId bigint NOT NULL PRIMARY KEY, ObjectId int NOT NULL, FirstSeenUtc datetime2(0) NOT NULL);
-IF OBJECT_ID(N'tempdb..##prt_Interval') IS NULL
-    CREATE TABLE ##prt_Interval
-    (
-        QueryId        bigint        NOT NULL,
-        IntervalId     bigint        NOT NULL,
-        PlanId         bigint        NOT NULL,
-        ExecutionType  tinyint       NOT NULL,
-        ObjectId       int           NOT NULL,
-        PlanHash       binary(8)     NOT NULL,
-        StartUtc       datetime2(0)  NOT NULL,
-        EndUtc         datetime2(0)  NOT NULL,
-        Execs          bigint        NOT NULL,
-        CpuUs          float         NOT NULL,
-        DurUs          float         NOT NULL,
-        Reads          float         NOT NULL,
-        PRIMARY KEY (QueryId, IntervalId, PlanId, ExecutionType)
-    );
-IF OBJECT_ID(N'tempdb..##prt_Wait') IS NULL
-    CREATE TABLE ##prt_Wait
-    (
-        QueryId        bigint        NOT NULL,
-        IntervalId     bigint        NOT NULL,
-        PlanId         bigint        NOT NULL,
-        ExecutionType  tinyint       NOT NULL,
-        WaitCategory   nvarchar(60)  NOT NULL,
-        WaitMs         float         NOT NULL,
-        PRIMARY KEY (QueryId, IntervalId, PlanId, ExecutionType, WaitCategory)
-    );
--- events live here too, so they survive if Window 2 is closed
-IF OBJECT_ID(N'tempdb..##prt_Event') IS NULL
-    CREATE TABLE ##prt_Event
-    (
-        EventId           int IDENTITY(1,1) PRIMARY KEY,
-        QueryId           bigint        NOT NULL,
-        ObjectId          int           NOT NULL,
-        ModuleName        nvarchar(300) NULL,
-        Status            varchar(10)   NOT NULL,      -- Open / Resolved
-        FirstUtc          datetime2(0)  NOT NULL,
-        LastBadUtc        datetime2(0)  NOT NULL,
-        ResolvedUtc       datetime2(0)  NULL,
-        BasePlanHash      binary(8)     NULL,
-        NewPlanHash       binary(8)     NOT NULL,
-        BasePlanId        bigint        NULL,
-        NewPlanId         bigint        NULL,
-        NewPlanSharePct   float         NULL,
-        BaseExecs         bigint        NULL,
-        CurExecs          bigint        NULL,
-        BaseCpuMs         float         NULL,
-        CurCpuMs          float         NULL,
-        BaseDurMs         float         NULL,
-        CurDurMs          float         NULL,
-        BaseReads         float         NULL,
-        CurReads          float         NULL,
-        ExtraCpuSecH      float         NULL,
-        ExtraWaitSecH     float         NULL,
-        ExtraReadsH       float         NULL,
-        Signals           nvarchar(400) NULL,
-        WaitDetail        nvarchar(1000) NULL,
-        Printed           bit           NOT NULL DEFAULT (0),
-        ResolvedPrinted   bit           NOT NULL DEFAULT (0)
-    );
-
-IF NOT EXISTS (SELECT 1 FROM ##prt_State)
-    INSERT ##prt_State (DatabaseName) VALUES (DB_NAME());
 IF (SELECT DatabaseName FROM ##prt_State) <> DB_NAME()
 BEGIN
-    RAISERROR(N'The ## tables belong to another database. Close the other Window 1 or DROP the ##prt_ tables.', 16, 1);
+    RAISERROR(N'Run this in the same database as Window 1.', 16, 1);
     RETURN;
 END;
 
-DECLARE @HasWaits bit = CASE WHEN OBJECT_ID(N'sys.query_store_wait_stats') IS NOT NULL THEN 1 ELSE 0 END;
-DECLARE @wm bigint, @from bigint, @minId bigint, @maxId bigint, @maxAll bigint, @FromStart datetimeoffset,
-        @runnable decimal(9,2), @blocked int, @msg nvarchar(400), @rows int, @kept int,
-        @delay char(8) = CONVERT(char(8), DATEADD(minute, @EveryMin, 0), 108),
-        @wmStart datetime2(0), @knownStart datetime2(0);
+DECLARE @Now datetime2(0) = (SELECT LastIntervalEndUtc FROM ##prt_State);     -- data time, not clock time
+IF @Now IS NULL BEGIN PRINT 'Window 1 has not loaded any interval yet.'; RETURN; END;
 
-WHILE 1 = 1
+DECLARE @CurStart  datetime2(0) = DATEADD(minute, -@CurrentWindowMin, @Now);
+DECLARE @BaseStart datetime2(0) = DATEADD(hour, -@BaselineHours, @CurStart);
+DECLARE @CurH      float        = @CurrentWindowMin / 60.0;
+
+PRINT CONCAT('Detection at ', CONVERT(varchar(19), SYSDATETIME(), 120), ' | data up to ', CONVERT(varchar(19), @Now, 120),
+             ' UTC | current window from ', CONVERT(varchar(19), @CurStart, 120), ' | baseline from ', CONVERT(varchar(19), @BaseStart, 120));
+
+/* ---- aggregates: per statement, window (B/C) and plan ---- */
+DROP TABLE IF EXISTS #A;
+SELECT i.QueryId, CASE WHEN i.StartUtc >= @CurStart THEN 'C' ELSE 'B' END AS Win, i.PlanHash,
+       MAX(i.PlanId) AS LastPlanId, MIN(i.StartUtc) AS FirstUtc,
+       SUM(i.Execs) AS Execs, SUM(CASE WHEN i.ExecutionType = 3 THEN i.Execs ELSE 0 END) AS Aborted,
+       SUM(i.CpuUs) AS Cpu, SUM(i.DurUs) AS Dur, SUM(i.Reads) AS Reads
+INTO #A
+FROM ##prt_Interval AS i
+WHERE i.StartUtc >= @BaseStart AND i.StartUtc < @Now
+  AND i.QueryId IN (SELECT QueryId FROM ##prt_Interval WHERE StartUtc >= @CurStart AND StartUtc < @Now)
+GROUP BY i.QueryId, CASE WHEN i.StartUtc >= @CurStart THEN 'C' ELSE 'B' END, i.PlanHash;
+
+DROP TABLE IF EXISTS #W;
+SELECT w.QueryId, CASE WHEN k.StartUtc >= @CurStart THEN 'C' ELSE 'B' END AS Win, k.PlanHash, w.WaitCategory, SUM(w.WaitMs) AS WaitMs
+INTO #W
+FROM ##prt_Wait AS w
+JOIN (SELECT DISTINCT QueryId, IntervalId, PlanId, PlanHash, StartUtc FROM ##prt_Interval) AS k
+  ON k.QueryId = w.QueryId AND k.IntervalId = w.IntervalId AND k.PlanId = w.PlanId
+WHERE k.StartUtc >= @BaseStart AND k.StartUtc < @Now
+  AND w.WaitCategory NOT IN (N'Idle', N'User Wait')
+  AND w.QueryId IN (SELECT QueryId FROM #A)
+GROUP BY w.QueryId, CASE WHEN k.StartUtc >= @CurStart THEN 'C' ELSE 'B' END, k.PlanHash, w.WaitCategory;
+
+/* ---- per statement totals + dominant current plan ---- */
+DROP TABLE IF EXISTS #T;
+SELECT QueryId,
+       SUM(CASE WHEN Win = 'B' THEN Execs   ELSE 0 END) AS BaseExecs,
+       SUM(CASE WHEN Win = 'B' THEN Aborted ELSE 0 END) AS BaseAborted,
+       SUM(CASE WHEN Win = 'B' THEN Cpu     ELSE 0 END) AS BaseCpu,
+       SUM(CASE WHEN Win = 'B' THEN Dur     ELSE 0 END) AS BaseDur,
+       SUM(CASE WHEN Win = 'B' THEN Reads   ELSE 0 END) AS BaseReads,
+       SUM(CASE WHEN Win = 'C' THEN Execs   ELSE 0 END) AS CurExecs,
+       SUM(CASE WHEN Win = 'C' THEN Cpu     ELSE 0 END) AS CurCpu,
+       SUM(CASE WHEN Win = 'C' THEN Reads   ELSE 0 END) AS CurReads,
+       CAST(NULL AS binary(8)) AS TopHash, CAST(NULL AS bigint) AS TopPlanId, CAST(NULL AS datetime2(0)) AS TopFirstUtc,
+       CAST(NULL AS bigint) AS TopExecs, CAST(NULL AS bigint) AS TopAborted,
+       CAST(NULL AS float) AS TopCpu, CAST(NULL AS float) AS TopDur, CAST(NULL AS float) AS TopReads,
+       CAST(NULL AS bigint) AS TopBaseExecs, CAST(NULL AS binary(8)) AS BaseHash, CAST(NULL AS bigint) AS BasePlanId
+INTO #T
+FROM #A
+GROUP BY QueryId;
+
+UPDATE t
+SET TopHash = x.PlanHash, TopPlanId = x.LastPlanId, TopExecs = x.Execs, TopAborted = x.Aborted,
+    TopCpu = x.Cpu, TopDur = x.Dur, TopReads = x.Reads
+FROM #T AS t
+CROSS APPLY (SELECT TOP (1) a.* FROM #A AS a WHERE a.QueryId = t.QueryId AND a.Win = 'C' ORDER BY a.Execs DESC, a.Cpu DESC) AS x;
+
+UPDATE t
+SET TopBaseExecs = ISNULL((SELECT a.Execs FROM #A AS a WHERE a.QueryId = t.QueryId AND a.Win = 'B' AND a.PlanHash = t.TopHash), 0),
+    TopFirstUtc  = (SELECT MIN(a.FirstUtc) FROM #A AS a WHERE a.QueryId = t.QueryId AND a.PlanHash = t.TopHash),
+    BaseHash     = b.PlanHash,
+    BasePlanId   = b.LastPlanId
+FROM #T AS t
+OUTER APPLY (SELECT TOP (1) a.PlanHash, a.LastPlanId FROM #A AS a WHERE a.QueryId = t.QueryId AND a.Win = 'B' ORDER BY a.Execs DESC) AS b;
+
+/* ---- per statement metrics + flags ---- */
+DROP TABLE IF EXISTS #R;
+SELECT t.QueryId, t.TopHash, t.TopPlanId, t.TopFirstUtc, t.BaseHash, t.BasePlanId, t.BaseExecs, t.CurExecs, t.TopExecs, t.TopAborted,
+       CAST(t.TopExecs AS float) / NULLIF(t.CurExecs, 0)     AS TopShare,
+       CAST(t.TopBaseExecs AS float) / NULLIF(t.BaseExecs, 0) AS TopBaseShare,
+       t.BaseCpu / NULLIF(t.BaseExecs, 0) AS bCpu,   t.TopCpu / NULLIF(t.TopExecs, 0) AS cCpu,
+       t.BaseDur / NULLIF(t.BaseExecs, 0) AS bDur,   t.TopDur / NULLIF(t.TopExecs, 0) AS cDur,
+       t.BaseReads / NULLIF(t.BaseExecs, 0) AS bReads, t.TopReads / NULLIF(t.TopExecs, 0) AS cReads,
+       CAST(t.BaseAborted AS float) / NULLIF(t.BaseExecs, 0) AS bAb,
+       CAST(t.TopAborted AS float) / NULLIF(t.TopExecs, 0)   AS cAb,
+       CAST(t.TopExecs AS float) / @CurH AS ExecPerHour,
+       CAST(0 AS bit) AS ReadsUp, CAST(0 AS bit) AS CpuUp, CAST(0 AS bit) AS AbortUp, CAST(0 AS bit) AS WaitUp,
+       CAST(0 AS float) AS ExtraCpuSecH, CAST(0 AS float) AS ExtraReadsH, CAST(0 AS float) AS ExtraWaitSecH,
+       CAST(NULL AS nvarchar(1000)) AS WaitDetail, CAST(NULL AS nvarchar(200)) AS Verdict
+INTO #R
+FROM #T AS t;
+
+UPDATE #R
+SET ReadsUp = CASE WHEN cReads > bReads AND cReads >= @ReadsRatio * bReads THEN 1 ELSE 0 END,
+    CpuUp   = CASE WHEN cCpu >= @CpuRatio * bCpu AND cCpu - bCpu >= @CpuMinDeltaMs * 1000.0 THEN 1 ELSE 0 END,
+    AbortUp = CASE WHEN cAb - bAb >= @AbortDelta AND TopAborted >= 3 THEN 1 ELSE 0 END,
+    ExtraCpuSecH = ISNULL((cCpu - bCpu) * ExecPerHour / 1000000.0, 0),
+    ExtraReadsH  = ISNULL((cReads - bReads) * ExecPerHour, 0);
+
+DROP TABLE IF EXISTS #WC;
+SELECT x.QueryId, x.WaitCategory, x.BaseMs, x.CurMs,
+       CASE WHEN x.CurMs >= @WaitMinMs AND x.CurMs >= @WaitRatio * x.BaseMs
+                 AND (x.CurMs - x.BaseMs) * r.ExecPerHour / 1000.0 >= @MinExtraWaitSecH THEN 1 ELSE 0 END AS Up,
+       (x.CurMs - x.BaseMs) * r.ExecPerHour / 1000.0 AS ExtraSecH
+INTO #WC
+FROM (
+    SELECT w.QueryId, w.WaitCategory,
+           ISNULL(SUM(CASE WHEN w.Win = 'B' THEN w.WaitMs END), 0) / NULLIF(MAX(r.BaseExecs), 0) AS BaseMs,
+           ISNULL(SUM(CASE WHEN w.Win = 'C' AND w.PlanHash = r.TopHash THEN w.WaitMs END), 0) / NULLIF(MAX(r.TopExecs), 0) AS CurMs
+    FROM #W AS w JOIN #R AS r ON r.QueryId = w.QueryId
+    GROUP BY w.QueryId, w.WaitCategory
+) AS x
+JOIN #R AS r ON r.QueryId = x.QueryId;
+
+UPDATE r
+SET WaitUp = CASE WHEN EXISTS (SELECT 1 FROM #WC AS c WHERE c.QueryId = r.QueryId AND c.Up = 1) THEN 1 ELSE 0 END,
+    ExtraWaitSecH = ISNULL((SELECT SUM(c.ExtraSecH) FROM #WC AS c WHERE c.QueryId = r.QueryId AND c.Up = 1), 0),
+    WaitDetail = STUFF((SELECT N'; ' + c.WaitCategory + N' ' + FORMAT(c.CurMs, 'N1') + N' ms/exec (was ' + FORMAT(c.BaseMs, 'N1') + N')'
+                               + CASE WHEN c.Up = 1 THEN N' UP' ELSE N'' END
+                        FROM #WC AS c
+                        WHERE c.QueryId = r.QueryId AND (c.CurMs >= 1 OR c.BaseMs >= 1)
+                        ORDER BY c.Up DESC, c.CurMs DESC
+                        FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'')
+FROM #R AS r;
+
+UPDATE #R
+SET Verdict = CASE
+    WHEN BaseExecs < @MinBaseExecs THEN CONCAT('no: baseline has ', BaseExecs, ' execs (need ', @MinBaseExecs, ')')
+    WHEN ISNULL(TopExecs, 0) < @MinCurExecs THEN CONCAT('no: dominant plan has ', ISNULL(TopExecs, 0), ' current execs (need ', @MinCurExecs, ')')
+    WHEN TopShare < @NewPlanMinShare THEN CONCAT('no: dominant plan runs only ', FORMAT(TopShare * 100, 'N0'), '% of current execs')
+    WHEN ISNULL(TopBaseShare, 0) > @NewPlanMaxBaseShare THEN CONCAT('no: same plan as baseline (', FORMAT(TopBaseShare * 100, 'N0'), '% of baseline execs)')
+    WHEN ReadsUp = 0 AND CpuUp = 0 AND WaitUp = 0 AND AbortUp = 0 THEN 'no: new plan, but cost per exec not up enough'
+    WHEN NOT (ExtraCpuSecH >= @MinExtraCpuSecH OR ExtraWaitSecH >= @MinExtraWaitSecH OR ExtraReadsH >= @MinExtraReadsH OR AbortUp = 1)
+         THEN CONCAT('no: new plan + costlier, but impact small (', FORMAT(ExtraCpuSecH, 'N1'), ' CPU s/h, ', FORMAT(ExtraReadsH, 'N0'), ' reads/h)')
+    ELSE 'ALERT' END;
+
+/* ---- events ---- */
+
+-- open events still bad compared with their FROZEN baseline?
+UPDATE e
+SET LastBadUtc = @Now
+FROM ##prt_Event AS e
+JOIN #T AS t ON t.QueryId = e.QueryId
+WHERE e.Status = 'Open' AND t.CurExecs > 0
+  AND (    t.CurReads / NULLIF(t.CurExecs, 0) > @ResolveRatio * ISNULL(e.BaseReads, 0)
+       OR (t.CurCpu / NULLIF(t.CurExecs, 0) / 1000.0 > @ResolveRatio * ISNULL(e.BaseCpuMs, 0)
+           AND t.CurCpu / NULLIF(t.CurExecs, 0) / 1000.0 - ISNULL(e.BaseCpuMs, 0) >= @CpuMinDeltaMs));
+
+-- already open: refresh current numbers (baseline stays frozen)
+UPDATE e
+SET LastBadUtc = @Now, NewPlanHash = r.TopHash, NewPlanId = r.TopPlanId, NewPlanSharePct = r.TopShare * 100,
+    CurExecs = r.TopExecs, CurCpuMs = r.cCpu / 1000.0, CurDurMs = r.cDur / 1000.0, CurReads = r.cReads,
+    ExtraCpuSecH = r.ExtraCpuSecH, ExtraWaitSecH = r.ExtraWaitSecH, ExtraReadsH = r.ExtraReadsH, WaitDetail = r.WaitDetail
+FROM ##prt_Event AS e
+JOIN #R AS r ON r.QueryId = e.QueryId
+WHERE e.Status = 'Open' AND r.Verdict = 'ALERT';
+
+-- new events
+INSERT ##prt_Event (QueryId, ObjectId, ModuleName, Status, FirstUtc, LastBadUtc, BasePlanHash, NewPlanHash, BasePlanId, NewPlanId,
+                    NewPlanSharePct, BaseExecs, CurExecs, BaseCpuMs, CurCpuMs, BaseDurMs, CurDurMs, BaseReads, CurReads,
+                    ExtraCpuSecH, ExtraWaitSecH, ExtraReadsH, Signals, WaitDetail)
+SELECT r.QueryId, o.ObjectId, OBJECT_SCHEMA_NAME(o.ObjectId) + N'.' + OBJECT_NAME(o.ObjectId), 'Open', @Now, @Now,
+       r.BaseHash, r.TopHash, r.BasePlanId, r.TopPlanId,
+       r.TopShare * 100, r.BaseExecs, r.TopExecs, r.bCpu / 1000.0, r.cCpu / 1000.0, r.bDur / 1000.0, r.cDur / 1000.0, r.bReads, r.cReads,
+       r.ExtraCpuSecH, r.ExtraWaitSecH, r.ExtraReadsH,
+       LEFT(CONCAT('new plan runs ', FORMAT(r.TopShare * 100, 'N0'), '% of executions',
+                   CASE WHEN r.ReadsUp = 1 THEN '; reads/exec x' + FORMAT(r.cReads / NULLIF(r.bReads, 0), 'N1') END,
+                   CASE WHEN r.CpuUp   = 1 THEN '; CPU/exec x'   + FORMAT(r.cCpu / NULLIF(r.bCpu, 0), 'N1') END,
+                   CASE WHEN r.WaitUp  = 1 THEN '; waits up' END,
+                   CASE WHEN r.AbortUp = 1 THEN '; timeouts/aborts ' + FORMAT(r.cAb * 100, 'N1') + '%' END), 400),
+       r.WaitDetail
+FROM #R AS r
+CROSS APPLY (SELECT MAX(ObjectId) AS ObjectId FROM ##prt_Interval AS i WHERE i.QueryId = r.QueryId) AS o
+WHERE r.Verdict = 'ALERT'
+  AND NOT EXISTS (SELECT 1 FROM ##prt_Event AS e WHERE e.QueryId = r.QueryId AND e.Status = 'Open');
+
+-- resolve
+UPDATE ##prt_Event
+SET Status = 'Resolved', ResolvedUtc = @Now
+WHERE Status = 'Open' AND LastBadUtc <= DATEADD(minute, -@ResolveMin, @Now);
+
+/* ---- print new alerts ---- */
+DECLARE @id int, @q bigint, @obj int, @bp bigint, @np bigint, @line nvarchar(4000), @txt nvarchar(400),
+        @hints nvarchar(2000), @newFirst datetime2(0), @modUtc datetime2(0), @compile datetimeoffset,
+        @bForced bit, @bFail bigint, @bReason nvarchar(128),
+        @w char(1), @pid bigint, @ptxt nvarchar(max), @x xml;
+DROP TABLE IF EXISTS #pf;
+CREATE TABLE #pf (Which char(1) NOT NULL PRIMARY KEY, PlanId bigint NULL, Params nvarchar(2000) NULL, EstRows float NULL,
+                  IsParallel bit NULL, DesiredMemKB bigint NULL, Loaded bit NOT NULL DEFAULT (0));
+
+SET @id = (SELECT MIN(EventId) FROM ##prt_Event WHERE Printed = 0);
+WHILE @id IS NOT NULL
 BEGIN
-    SET @msg = NULL; SET @minId = NULL; SET @maxId = NULL; SET @from = NULL; SET @wmStart = NULL; SET @maxAll = NULL;
-    SELECT @wm = LastIntervalId, @knownStart = LastIntervalStartUtc FROM ##prt_State;
+    SELECT @q = QueryId, @obj = ObjectId, @bp = BasePlanId, @np = NewPlanId FROM ##prt_Event WHERE EventId = @id;
 
-    /* ---- load check ---- */
-    SELECT @runnable = AVG(CAST(runnable_tasks_count AS decimal(9,2))) FROM sys.dm_os_schedulers WHERE status = N'VISIBLE ONLINE';
-    SELECT @blocked = COUNT(*) FROM sys.dm_exec_requests WHERE blocking_session_id > 0;
-    IF @runnable > @MaxAvgRunnable OR @blocked > @MaxBlocked
-        SET @msg = N'Server busy (avg runnable ' + CAST(@runnable AS nvarchar(20)) + N', blocked ' + CAST(@blocked AS nvarchar(20)) + N') - cycle skipped.';
+    SET @txt = (SELECT TOP (1) LEFT(REPLACE(REPLACE(t.query_sql_text, NCHAR(13), N' '), NCHAR(10), N' '), 400)
+                FROM sys.query_store_query AS q JOIN sys.query_store_query_text AS t ON t.query_text_id = q.query_text_id
+                WHERE q.query_id = @q);
 
-    /* ---- Query Store reset? (ids went backwards or the watermark interval changed) ---- */
-    IF @msg IS NULL AND @wm IS NOT NULL
+    /* plan facts for the baseline plan (B) and the new plan (N) */
+    DELETE #pf;
+    INSERT #pf (Which, PlanId) VALUES ('B', @bp), ('N', @np);
+    SET @w = 'B';
+    SELECT @txt = NULL, @hints = N'', @bForced = NULL, @bFail = NULL, @bReason = NULL, @newFirst = NULL, @compile = NULL, @modUtc = NULL;
+    WHILE @w IS NOT NULL
     BEGIN
-        SELECT @maxAll = MAX(runtime_stats_interval_id) FROM sys.query_store_runtime_stats_interval;
-        SELECT @wmStart = CONVERT(datetime2(0), SWITCHOFFSET(start_time, '+00:00'))
-        FROM sys.query_store_runtime_stats_interval WHERE runtime_stats_interval_id = @wm;
-        IF @maxAll IS NULL OR @maxAll < @wm OR (@wmStart IS NOT NULL AND ABS(DATEDIFF(minute, @wmStart, @knownStart)) > 1)
-        BEGIN
-            TRUNCATE TABLE ##prt_Interval; TRUNCATE TABLE ##prt_Wait; DELETE ##prt_Watch;
-            UPDATE ##prt_State SET LastIntervalId = NULL, LastIntervalStartUtc = NULL, LastIntervalEndUtc = NULL;
-            SET @wm = NULL;
-            RAISERROR(N'Query Store was cleared or restored: collected data reset, starting again.', 10, 1) WITH NOWAIT;
-        END;
+        SELECT @pid = PlanId FROM #pf WHERE Which = @w;
+        SET @x = NULL; SET @ptxt = NULL;
+        BEGIN TRY
+            SELECT @ptxt = query_plan FROM sys.query_store_plan WHERE plan_id = @pid;
+            SET @x = TRY_CONVERT(xml, @ptxt);
+            IF @x IS NOT NULL
+            BEGIN
+            ;WITH XMLNAMESPACES (DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan')
+            UPDATE #pf
+            SET Params = LEFT(@x.query('for $c in //QueryPlan/ParameterList/ColumnReference
+                                        return concat(string($c/@Column), "=", string($c/@ParameterCompiledValue), ";")').value('.', 'nvarchar(max)'), 2000),
+                EstRows = @x.value('(//StmtSimple/@StatementEstRows)[1]', 'float'),
+                IsParallel = @x.exist('//RelOp[@Parallel="1" or @Parallel="true"]'),
+                DesiredMemKB = @x.value('(//MemoryGrantInfo/@SerialDesiredMemory)[1]', 'bigint'),
+                Loaded = 1
+            WHERE Which = @w;
+            END;
+        END TRY
+        BEGIN CATCH
+            -- very deep plans cannot be converted to xml; skip the facts
+        END CATCH;
+        SET @w = CASE WHEN @w = 'B' THEN 'N' END;
     END;
 
-    /* ---- interval range: new + closed + flushed ---- */
-    IF @msg IS NULL
+    SET @hints = N'';
+    SELECT @bForced = CAST(is_forced_plan AS bit), @bFail = force_failure_count, @bReason = last_force_failure_reason_desc
+    FROM sys.query_store_plan WHERE plan_id = @bp;
+    IF @bForced = 1
+        SET @hints += N'Baseline plan is FORCED' + CASE WHEN @bFail > 0 THEN N' but forcing fails (' + ISNULL(@bReason, N'?') + N')' ELSE N'' END + N'. ';
+    SELECT @hints += CASE WHEN b.IsParallel <> n.IsParallel THEN CASE WHEN n.IsParallel = 1 THEN N'Plan went parallel. ' ELSE N'Plan went serial. ' END ELSE N'' END
+                   + CASE WHEN ISNULL(b.Params, N'') <> ISNULL(n.Params, N'') AND b.Loaded = 1 AND n.Loaded = 1
+                          THEN N'Compiled for different parameter values (parameter sniffing?): before [' + ISNULL(b.Params, N'') + N'] now [' + ISNULL(n.Params, N'') + N']. ' ELSE N'' END
+                   + CASE WHEN b.EstRows > 0 AND n.EstRows > 0 AND (n.EstRows / b.EstRows >= 10 OR b.EstRows / n.EstRows >= 10)
+                          THEN N'Estimated rows ' + FORMAT(b.EstRows, 'N0') + N' -> ' + FORMAT(n.EstRows, 'N0') + N' (statistics / estimate). ' ELSE N'' END
+                   + CASE WHEN b.DesiredMemKB > 0 AND n.DesiredMemKB > 0 AND (n.DesiredMemKB * 1.0 / b.DesiredMemKB >= 4 OR b.DesiredMemKB * 1.0 / n.DesiredMemKB >= 4)
+                          THEN N'Memory grant ' + FORMAT(b.DesiredMemKB, 'N0') + N' KB -> ' + FORMAT(n.DesiredMemKB, 'N0') + N' KB. ' ELSE N'' END
+    FROM #pf AS b CROSS JOIN #pf AS n WHERE b.Which = 'B' AND n.Which = 'N';
+
+    SELECT @newFirst = MIN(StartUtc) FROM ##prt_Interval WHERE QueryId = @q AND PlanId = @np;
+    SELECT @compile = last_compile_start_time FROM sys.query_store_plan WHERE plan_id = @np;
+    SELECT @modUtc = DATEADD(minute, DATEDIFF(minute, SYSDATETIME(), SYSUTCDATETIME()), modify_date) FROM sys.objects WHERE object_id = @obj;
+    IF @modUtc BETWEEN DATEADD(hour, -6, @newFirst) AND DATEADD(hour, 1, @newFirst)
+        SET @hints += N'Module was modified at ' + CONVERT(nvarchar(19), @modUtc, 120) + N' UTC, close to when the new plan appeared. ';
+    SET @hints += N'New plan first seen ' + ISNULL(CONVERT(nvarchar(19), @newFirst, 120), N'?') + N' UTC, compiled '
+                + ISNULL(CONVERT(nvarchar(19), SWITCHOFFSET(@compile, '+00:00'), 120), N'?') + N' UTC.';
+
+    PRINT N'';
+    PRINT N'==================== PLAN REGRESSION (event ' + CAST(@id AS nvarchar(10)) + N') ====================';
+    SELECT @line = N'Module        : ' + ISNULL(ModuleName, CONCAT(N'object ', ObjectId)) + N'   (query_id ' + CAST(QueryId AS nvarchar(20)) + N', db ' + DB_NAME() + N')' FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    SELECT @line = N'What changed  : ' + Signals FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    SELECT @line = N'Plans         : ' + ISNULL(CONVERT(nvarchar(20), BasePlanHash, 1), N'?') + N' (plan_id ' + ISNULL(CAST(BasePlanId AS nvarchar(20)), N'?') + N')  ->  '
+                 + CONVERT(nvarchar(20), NewPlanHash, 1) + N' (plan_id ' + ISNULL(CAST(NewPlanId AS nvarchar(20)), N'?') + N')' FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    SELECT @line = N'Executions    : ' + FORMAT(BaseExecs, 'N0') + N' in baseline  ->  ' + FORMAT(CurExecs, 'N0') + N' on new plan in current window' FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    SELECT @line = N'CPU ms/exec   : ' + FORMAT(BaseCpuMs, 'N2') + N'  ->  ' + FORMAT(CurCpuMs, 'N2') FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    SELECT @line = N'Duration ms   : ' + FORMAT(BaseDurMs, 'N2') + N'  ->  ' + FORMAT(CurDurMs, 'N2') FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    SELECT @line = N'Reads/exec    : ' + FORMAT(BaseReads, 'N0') + N'  ->  ' + FORMAT(CurReads, 'N0') FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    SELECT @line = N'Waits/exec    : ' + ISNULL(WaitDetail, N'-') FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    SELECT @line = N'Extra cost    : ' + FORMAT(ExtraCpuSecH, 'N1') + N' CPU s/hour, ' + FORMAT(ExtraWaitSecH, 'N1') + N' wait s/hour, '
+                 + FORMAT(ExtraReadsH, 'N0') + N' reads/hour' FROM ##prt_Event WHERE EventId = @id; PRINT @line;
+    PRINT N'Likely cause  : ' + @hints;
+    PRINT N'Statement     : ' + ISNULL(@txt, N'(text not available)');
+    IF @bp IS NOT NULL
     BEGIN
-        IF @wm IS NULL
-            SELECT @from = MIN(runtime_stats_interval_id) - 1
-            FROM sys.query_store_runtime_stats_interval
-            WHERE start_time >= DATEADD(hour, -@BackfillHours, SYSDATETIMEOFFSET());
-        ELSE
-            SET @from = @wm - @ReReadIntervals;
-
-        IF @from IS NOT NULL
-            SELECT @minId = MIN(x.runtime_stats_interval_id), @maxId = MAX(x.runtime_stats_interval_id)
-            FROM (SELECT TOP (CASE WHEN @wm IS NULL THEN @BackfillHours * 60 ELSE @MaxIntervalsPerCycle + @ReReadIntervals END)
-                         i.runtime_stats_interval_id
-                  FROM sys.query_store_runtime_stats_interval AS i
-                  WHERE i.runtime_stats_interval_id > @from
-                    AND i.end_time <= DATEADD(minute, -@MarginMin, SYSDATETIMEOFFSET())
-                  ORDER BY i.runtime_stats_interval_id) AS x;
-
-        IF @maxId IS NULL OR (@wm IS NOT NULL AND @maxId <= @wm)
-            SET @msg = N'No new closed interval yet.';
+        PRINT N'Fix (REVIEW, run on the PRIMARY):';
+        PRINT N'    EXEC sys.sp_query_store_force_plan @query_id = ' + CAST(@q AS nvarchar(20)) + N', @plan_id = ' + CAST(@bp AS nvarchar(20)) + N';';
+        PRINT N'    -- undo: EXEC sys.sp_query_store_unforce_plan @query_id = ' + CAST(@q AS nvarchar(20)) + N', @plan_id = ' + CAST(@bp AS nvarchar(20)) + N';';
     END;
 
-    /* ---- read runtime (plan-driven: module plans that ran since the first interval) ---- */
-    IF @msg IS NULL
-    BEGIN
-        SELECT @FromStart = start_time FROM sys.query_store_runtime_stats_interval WHERE runtime_stats_interval_id = @minId;
-
-        DROP TABLE IF EXISTS #p;
-        SELECT pl.plan_id, pl.query_id, q.object_id, pl.query_plan_hash
-        INTO #p
-        FROM sys.query_store_plan AS pl
-        JOIN sys.query_store_query AS q ON q.query_id = pl.query_id
-        WHERE q.object_id > 0 AND pl.last_execution_time >= @FromStart
-        OPTION (MAXDOP 1);
-        CREATE UNIQUE CLUSTERED INDEX cx ON #p (plan_id);
-
-        DROP TABLE IF EXISTS #rt;
-        SELECT p.query_id AS QueryId, rs.runtime_stats_interval_id AS IntervalId, rs.plan_id AS PlanId,
-               CAST(rs.execution_type AS tinyint) AS ExecutionType, p.object_id AS ObjectId, p.query_plan_hash AS PlanHash,
-               CONVERT(datetime2(0), SWITCHOFFSET(i.start_time, '+00:00')) AS StartUtc,
-               CONVERT(datetime2(0), SWITCHOFFSET(i.end_time, '+00:00'))   AS EndUtc,
-               SUM(rs.count_executions)                          AS Execs,
-               SUM(rs.avg_cpu_time * rs.count_executions)         AS CpuUs,
-               SUM(rs.avg_duration * rs.count_executions)         AS DurUs,
-               SUM(rs.avg_logical_io_reads * rs.count_executions) AS Reads
-        INTO #rt
-        FROM #p AS p
-        JOIN sys.query_store_runtime_stats AS rs ON rs.plan_id = p.plan_id
-        JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
-        WHERE rs.runtime_stats_interval_id BETWEEN @minId AND @maxId
-        GROUP BY p.query_id, rs.runtime_stats_interval_id, rs.plan_id, rs.execution_type, p.object_id, p.query_plan_hash, i.start_time, i.end_time
-        OPTION (MAXDOP 1);
-        SET @rows = @@ROWCOUNT;
-
-        /* which statements to keep: top N by CPU / reads per interval, heavy ones, and anything already watched */
-        WITH qi AS (
-            SELECT QueryId, IntervalId, MAX(ObjectId) AS ObjectId, MIN(StartUtc) AS StartUtc, SUM(CpuUs) AS Cpu, SUM(Reads) AS Reads
-            FROM #rt GROUP BY QueryId, IntervalId
-        ), rk AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY IntervalId ORDER BY Cpu DESC)   AS rc,
-                      ROW_NUMBER() OVER (PARTITION BY IntervalId ORDER BY Reads DESC) AS rr
-            FROM qi
-        )
-        INSERT ##prt_Watch (QueryId, ObjectId, FirstSeenUtc)
-        SELECT QueryId, MAX(ObjectId), MIN(StartUtc)
-        FROM rk
-        WHERE (rc <= @TopN OR rr <= @TopN OR Cpu >= @KeepMinCpuMs * 1000.0)
-          AND NOT EXISTS (SELECT 1 FROM ##prt_Watch AS w WHERE w.QueryId = rk.QueryId)
-        GROUP BY QueryId;
-
-        -- delete + insert, so re-reading an interval is safe
-        DELETE i FROM ##prt_Interval AS i
-        WHERE i.IntervalId BETWEEN @minId AND @maxId AND EXISTS (SELECT 1 FROM ##prt_Watch AS w WHERE w.QueryId = i.QueryId);
-        INSERT ##prt_Interval (QueryId, IntervalId, PlanId, ExecutionType, ObjectId, PlanHash, StartUtc, EndUtc, Execs, CpuUs, DurUs, Reads)
-        SELECT r.QueryId, r.IntervalId, r.PlanId, r.ExecutionType, r.ObjectId, r.PlanHash, r.StartUtc, r.EndUtc, r.Execs, r.CpuUs, r.DurUs, r.Reads
-        FROM #rt AS r
-        WHERE EXISTS (SELECT 1 FROM ##prt_Watch AS w WHERE w.QueryId = r.QueryId);
-        SET @kept = @@ROWCOUNT;
-
-        /* waits per plan (2017+). Dynamic SQL only so the script also compiles on 2016. */
-        IF @HasWaits = 1
-        BEGIN
-            DELETE x FROM ##prt_Wait AS x WHERE x.IntervalId BETWEEN @minId AND @maxId;
-            EXEC sys.sp_executesql N'
-                INSERT ##prt_Wait (QueryId, IntervalId, PlanId, ExecutionType, WaitCategory, WaitMs)
-                SELECT p.query_id, ws.runtime_stats_interval_id, ws.plan_id, CAST(ws.execution_type AS tinyint),
-                       ws.wait_category_desc, SUM(CAST(ws.total_query_wait_time_ms AS float))
-                FROM #p AS p
-                JOIN sys.query_store_wait_stats AS ws ON ws.plan_id = p.plan_id
-                WHERE ws.runtime_stats_interval_id BETWEEN @minId AND @maxId
-                  AND ws.total_query_wait_time_ms > 0
-                  AND EXISTS (SELECT 1 FROM ##prt_Watch AS w WHERE w.QueryId = p.query_id)
-                GROUP BY p.query_id, ws.runtime_stats_interval_id, ws.plan_id, ws.execution_type, ws.wait_category_desc
-                OPTION (MAXDOP 1);',
-                N'@minId bigint, @maxId bigint', @minId = @minId, @maxId = @maxId;
-        END;
-
-        UPDATE s
-        SET LastIntervalId = x.runtime_stats_interval_id,
-            LastIntervalStartUtc = CONVERT(datetime2(0), SWITCHOFFSET(x.start_time, '+00:00')),
-            LastIntervalEndUtc   = CONVERT(datetime2(0), SWITCHOFFSET(x.end_time, '+00:00'))
-        FROM ##prt_State AS s
-        CROSS JOIN sys.query_store_runtime_stats_interval AS x
-        WHERE x.runtime_stats_interval_id = @maxId;
-
-        SET @msg = N'Intervals ' + CAST(@minId AS nvarchar(20)) + N'-' + CAST(@maxId AS nvarchar(20)) +
-                   N': ' + CAST(@rows AS nvarchar(20)) + N' runtime rows read, ' + CAST(@kept AS nvarchar(20)) + N' kept, ' +
-                   CAST((SELECT COUNT(*) FROM ##prt_Watch) AS nvarchar(20)) + N' statements watched.';
-    END;
-
-    UPDATE ##prt_State SET Cycles = Cycles + 1, LastCycleUtc = SYSUTCDATETIME(), LastMessage = @msg;
-    SET @msg = CONVERT(nvarchar(19), SYSDATETIME(), 120) + N'  ' + @msg;
-    RAISERROR(@msg, 10, 1) WITH NOWAIT;
-
-    IF @Loop = 0 BREAK;
-    WAITFOR DELAY @delay;
+    UPDATE ##prt_Event SET Printed = 1 WHERE EventId = @id;
+    SET @id = (SELECT MIN(EventId) FROM ##prt_Event WHERE Printed = 0 AND EventId > @id);
 END;
+
+/* ---- print resolved ---- */
+SET @id = (SELECT MIN(EventId) FROM ##prt_Event WHERE Status = 'Resolved' AND ResolvedPrinted = 0);
+WHILE @id IS NOT NULL
+BEGIN
+    SELECT @line = N'RESOLVED event ' + CAST(EventId AS nvarchar(10)) + N': ' + ISNULL(ModuleName, N'?') + N' (query_id ' + CAST(QueryId AS nvarchar(20))
+                 + N') back within ' + FORMAT(@ResolveRatio, 'N1') + N'x of its baseline (or not running) for ' + CAST(@ResolveMin AS nvarchar(10)) + N' min.'
+    FROM ##prt_Event WHERE EventId = @id;
+    PRINT @line;
+    UPDATE ##prt_Event SET ResolvedPrinted = 1 WHERE EventId = @id;
+    SET @id = (SELECT MIN(EventId) FROM ##prt_Event WHERE Status = 'Resolved' AND ResolvedPrinted = 0 AND EventId > @id);
+END;
+
+IF NOT EXISTS (SELECT 1 FROM #R WHERE Verdict = 'ALERT')
+    PRINT N'No new plan regression in this run. See the Verdict column for why each statement is not an alert.';
+
+/* ---- result 1: what detection saw ---- */
+SELECT r.Verdict,
+       OBJECT_SCHEMA_NAME(o.ObjectId) + N'.' + OBJECT_NAME(o.ObjectId) AS ModuleName,
+       r.QueryId, r.BaseExecs, r.CurExecs, r.TopExecs AS NewPlanExecs,
+       CAST(r.TopShare * 100 AS decimal(6,1))     AS NewPlanPctNow,
+       CAST(r.TopBaseShare * 100 AS decimal(6,1)) AS NewPlanPctInBaseline,
+       CAST(r.bCpu / 1000.0 AS decimal(18,2)) AS BaseCpuMs, CAST(r.cCpu / 1000.0 AS decimal(18,2)) AS NowCpuMs,
+       CAST(r.bReads AS decimal(19,0)) AS BaseReads, CAST(r.cReads AS decimal(19,0)) AS NowReads,
+       r.ReadsUp, r.CpuUp, r.WaitUp, r.AbortUp,
+       CAST(r.ExtraCpuSecH AS decimal(18,1)) AS ExtraCpuSecH, CAST(r.ExtraReadsH AS decimal(19,0)) AS ExtraReadsH,
+       CAST(r.ExtraWaitSecH AS decimal(18,1)) AS ExtraWaitSecH, r.WaitDetail,
+       CONVERT(varchar(20), r.BaseHash, 1) AS BasePlanHash, r.BasePlanId,
+       CONVERT(varchar(20), r.TopHash, 1) AS NowPlanHash, r.TopPlanId AS NowPlanId
+FROM #R AS r
+CROSS APPLY (SELECT MAX(ObjectId) AS ObjectId FROM ##prt_Interval AS i WHERE i.QueryId = r.QueryId) AS o
+ORDER BY CASE WHEN r.Verdict = 'ALERT' THEN 0 ELSE 1 END, r.ExtraCpuSecH DESC;
+
+/* ---- result 2: all events ---- */
+SELECT EventId, Status, ModuleName, QueryId, Signals, FirstUtc, LastBadUtc, ResolvedUtc,
+       CAST(BaseCpuMs AS decimal(18,2)) AS BaseCpuMs, CAST(CurCpuMs AS decimal(18,2)) AS CurCpuMs,
+       CAST(BaseReads AS decimal(19,0)) AS BaseReads, CAST(CurReads AS decimal(19,0)) AS CurReads,
+       CAST(ExtraCpuSecH AS decimal(18,1)) AS ExtraCpuSecH, BasePlanId, NewPlanId, WaitDetail
+FROM ##prt_Event
+ORDER BY EventId DESC;
